@@ -1,0 +1,43 @@
+name: rutaviva_ai
+description: "RutaViva AI - Copiloto de viaje por carretera con cobertura intermitente (Perú)."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Estado
+  flutter_riverpod: ^2.6.1
+
+  # Segundo plano, ubicación, red y notificaciones
+  flutter_foreground_task: ^9.1.0
+  flutter_local_notifications: ^19.4.2   # NO subir a ^20 (cambia la firma de show/initialize)
+  geolocator: ^14.0.2
+  connectivity_plus: ^6.1.4
+  permission_handler: ^12.0.1
+
+  # Persistencia y red
+  shared_preferences: ^2.5.3
+  http: ^1.4.0
+
+  # UI
+  intl: ^0.20.2
+  shimmer: ^3.0.0
+  cached_network_image: ^3.4.1
+  url_launcher: ^6.3.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/data/rutas_peru.json
