@@ -1,51 +1,79 @@
-name: Build APK
+name: Build RutaViva APK
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Java 17
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
 
-      - name: Flutter (stable)
+      - name: Configurar Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
-          cache: true
+          channel: 'stable'
 
-      # El repo solo versiona los archivos propios de android/. El andamiaje
-      # (gradle wrapper, settings, estilos, iconos) se genera con flutter create
-      # y se copia SIN sobrescribir nada de lo ya existente.
-      - name: Completar andamiaje Android
+      - name: Normalizar carpetas y completar andamiaje Android
         run: |
           set -e
-          flutter create --project-name rutaviva_ai --org com.rutaviva --platforms=android /tmp/scaffold
-          rsync -a --ignore-existing /tmp/scaffold/android/ android/
-          rm -f android/app/build.gradle.kts
-          rm -rf android/app/src/main/kotlin/com/rutaviva/rutaviva_ai
-          ls android android/app/src/main/kotlin/com/rutaviva/ai
+          # 1. Si los archivos se subieron dentro de una subcarpeta (ej. rutaviva_ai/), moverlos a la raiz
+          if [ ! -f "pubspec.yaml" ]; then
+            SUBDIR=$(find . -maxdepth 2 -name "pubspec.yaml" | head -n 1 | xargs dirname)
+            if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
+              echo "Moviendo proyecto desde $SUBDIR a la raiz..."
+              shopt -s dotglob
+              mv "$SUBDIR"/* .
+              rmdir "$SUBDIR" || true
+            fi
+          fi
 
-      - name: Dependencias
+          # 2. Generar andamiaje base de Android con el paquete exacto com.rutaviva.ai
+          flutter create --platforms=android --org com.rutaviva --project-name ai /tmp/scaffold
+
+          # 3. Evitar conflicto entre build.gradle (Groovy) y build.gradle.kts (Kotlin DSL)
+          if [ -f "android/app/build.gradle" ]; then
+            rm -f /tmp/scaffold/android/app/build.gradle.kts
+          fi
+
+          # 4. Copiar archivos base de Gradle e iconos sin sobrescribir los nuestros
+          mkdir -p android
+          cp -rn /tmp/scaffold/android/. android/ || true
+
+          # 5. Asegurar que MainActivity.kt exista en la ruta correcta
+          mkdir -p android/app/src/main/kotlin/com/rutaviva/ai
+          if [ ! -f "android/app/src/main/kotlin/com/rutaviva/ai/MainActivity.kt" ]; then
+            cat << 'EOF' > android/app/src/main/kotlin/com/rutaviva/ai/MainActivity.kt
+          package com.rutaviva.ai
+
+          import io.flutter.embedding.android.FlutterActivity
+
+          class MainActivity: FlutterActivity()
+          EOF
+          fi
+
+          chmod +x android/gradlew
+          ls -la
+          ls -la android/app/src/main/kotlin/com/rutaviva/ai
+
+      - name: Instalar dependencias Flutter
         run: flutter pub get
 
-      - name: Compilar APK release
-        run: flutter build apk --release
+      - name: Compilar APK Release
+        run: flutter build apk --release --no-tree-shake-icons
 
-      - name: Subir APK
+      - name: Subir APK listo para descargar
         uses: actions/upload-artifact@v4
         with:
-          name: rutaviva-ai-apk
+          name: RutaViva-AI-APK
           path: build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
