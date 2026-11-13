@@ -448,16 +448,43 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
     }
   }
 
+  String? _preferredModel;
+  String? _preferredFor;
+
+  /// Pre-carga en segundo plano: descarga fotos + ficha IA y las deja en la
+  /// caché local para que la hoja del pueblo abra al instante.
+  /// Devuelve `true` si ya había caché o si se generó una ficha.
+  Future<bool> prefetch(TownModel town,
+      {required AppSettings settings, String? tripContext}) async {
+    try {
+      if (!settings.hasLlmKey) return false;
+      if (await readCache(town.id) != null) return true;
+      await for (final _ in loadTownGuide(town,
+          settings: settings, tripContext: tripContext)) {}
+      return await readCache(town.id) != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Llama a Gemini con cascada automática:
-  ///  · Modelos: el configurado y luego gemini-3.0-flash, gemini-3.8-flash,
-  ///    gemini-2.5-pro, gemini-2.0-flash (si hay HTTP 404 se pasa al siguiente).
+  ///  · Modelos: el configurado y luego gemini-3.8-flash, gemini-3.0-flash,
+  ///    gemini-3-flash-preview, gemini-2.5-pro, gemini-2.0-flash (si hay HTTP 404 se pasa al siguiente).
   ///  · Variantes por modelo (si hay HTTP 400): con google_search → sin tools con
   ///    esquema JSON → solo prompt. Así la guía SIEMPRE intenta generarse.
   Future<_LlmOutput> _callGemini(AppSettings s, String system, String user,
       Map<String, dynamic>? schema, int maxTokens,
       {required bool grounding}) async {
     final models = <String>[];
-    for (final m in [s.effectiveModel, ...AppConstants.geminiFallbackModels]) {
+    // El último modelo que respondió bien va primero: evita un 404 previo en
+    // cada llamada (latencia).
+    final preferred =
+        (_preferredFor == s.effectiveModel) ? _preferredModel : null;
+    for (final m in [
+      if (preferred != null) preferred,
+      s.effectiveModel,
+      ...AppConstants.geminiFallbackModels,
+    ]) {
       if (m.isNotEmpty && !models.contains(m)) models.add(m);
     }
     // (usa google_search, usa responseSchema)
@@ -469,8 +496,12 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
     for (final model in models) {
       for (final v in variants) {
         try {
-          return await _callGeminiOnce(s, model, system, user, schema, maxTokens,
+          final out = await _callGeminiOnce(
+              s, model, system, user, schema, maxTokens,
               tools: v.$1, useSchema: v.$2);
+          _preferredModel = model;
+          _preferredFor = s.effectiveModel;
+          return out;
         } on AiExplorerException catch (e) {
           last = e;
           if (e.statusCode == 404) break; // modelo no disponible → siguiente

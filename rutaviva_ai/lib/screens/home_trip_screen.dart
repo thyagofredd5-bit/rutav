@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/app_theme.dart';
+import '../models/geo_models.dart';
 import '../models/town_model.dart';
 import '../models/trip_models.dart';
 import '../providers/trip_provider.dart';
 import '../services/background_trip_service.dart';
 import '../services/offline_geocoder_service.dart';
+import '../widgets/destination_picker.dart';
 import '../widgets/rv_widgets.dart';
 import 'settings_screen.dart';
 import 'town_explorer_sheet.dart';
@@ -39,7 +41,7 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
     BackgroundTripService.consumeExploreRequest();
     final c = ref.read(tripProvider);
     final id = req.townId ?? c.snapshot?.progress.currentTownId;
-    final town = id == null ? null : c.geocoder.byId(id);
+    final town = c.townForId(id);
     if (town != null) TownExplorerSheet.show(context, town);
   }
 
@@ -90,9 +92,10 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
                 ),
               _nowPlaying(c),
               _controls(c),
-              RvSectionTitle(
-                'Línea de tiempo · ${stops.length} localidades',
-              ),
+              if (stops.isNotEmpty)
+                RvSectionTitle(
+                  'Línea de tiempo · ${stops.length} localidades',
+                ),
               for (var i = 0; i < stops.length; i++)
                 _TimelineTile(
                   stop: stops[i],
@@ -158,10 +161,13 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
     final p = snap?.progress;
     final town = c.currentTown;
     final next = c.nextTown;
-    final total = (c.destinationTown.kmRuta - c.originTown.kmRuta).abs();
+    final total = c.totalKm;
+    final corridor = c.mode == TripMode.corridor;
 
     // Descarga (y cachea) la foto panorámica del pueblo actual.
-    WidgetsBinding.instance.addPostFrameCallback((_) => c.ensureHero(town));
+    if (c.hasRealPlace) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => c.ensureHero(town));
+    }
 
     final String status;
     if (p == null) {
@@ -169,14 +175,16 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
     } else if (p.arrived) {
       status = 'Llegaste a tu destino';
     } else if (p.atTown) {
-      status = '${town.provincia} · estás en el pueblo';
+      status = corridor ? '${town.provincia} · estás en el pueblo' : 'Estás aquí';
     } else {
       status = 'Último pueblo · a ${formatKm(p.distanceToCurrentTownKm)} km';
     }
 
     final double? nextDist = p != null
         ? p.nextTownDistanceKm
-        : (next != null ? (next.kmRuta - c.originTown.kmRuta).abs() : null);
+        : (next != null && corridor
+            ? (next.kmRuta - c.originTown.kmRuta).abs()
+            : null);
     final remaining = p?.kmRemaining ?? total;
 
     final warnings = <String>[
@@ -200,16 +208,19 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
       imageUrl: c.heroFor(town)?.url,
       running: c.running,
       pillText: '${c.running ? 'EN RUTA' : 'LISTO'} • '
-          '${formatThousands(town.msnm)} msnm • Km ${town.kmRuta.round()}',
+          '${formatThousands(town.msnm)} msnm${corridor ? ' • Km ${town.kmRuta.round()}' : ''}',
       townName: town.nombre,
-      subtitle: '${town.provincia} · ${town.departamento}',
+      subtitle: [town.provincia, town.departamento]
+          .where((e) => e.trim().isNotEmpty)
+          .join(' · '),
       statusText: status,
-      nextLabel: next?.nombre ?? 'Destino',
+      nextLabel: next?.nombre ?? (c.mode == TripMode.free ? 'Explorando' : 'Destino'),
       nextDetail: nextDist != null
           ? 'Faltan ${formatKm(nextDist)} km'
-          : 'a la vista',
-      destinationDetail:
-          'Faltan ${formatKm(remaining)} km hasta ${c.destinationTown.nombreLugar}',
+          : (c.mode == TripMode.free ? 'sin destino' : 'a la vista'),
+      destinationDetail: c.mode == TripMode.free
+          ? 'Modo libre: te cuento qué hay donde estés'
+          : 'Faltan ${formatKm(remaining)} km hasta ${c.destinationLabel}',
       progress: p?.progress ?? 0,
       leftLabel: '${p?.percent ?? 0}% · ${formatKm(p?.kmTraveled ?? 0)} km',
       rightLabel: '${formatKm(p?.kmTotal ?? total)} km',
@@ -237,12 +248,65 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
 
   // ── Controles ──────────────────────────────────────────────────────────
 
+  Widget _modeSelector(TripController c) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const RvSectionTitle('Modo'),
+        SizedBox(
+          width: double.infinity,
+          child: SegmentedButton<TripMode>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment<TripMode>(
+                  value: TripMode.corridor, label: Text('Lima–Arequipa')),
+              ButtonSegment<TripMode>(
+                  value: TripMode.custom, label: Text('Destino')),
+              ButtonSegment<TripMode>(
+                  value: TripMode.free, label: Text('¿Dónde estoy?')),
+            ],
+            selected: {c.mode},
+            style: SegmentedButton.styleFrom(
+              backgroundColor: AppColors.surfaceHigh,
+              foregroundColor: AppColors.textMuted,
+              selectedBackgroundColor: AppColors.accentDeep,
+              selectedForegroundColor: AppColors.accent,
+              side: const BorderSide(color: AppColors.outline),
+              textStyle: const TextStyle(fontSize: 12),
+            ),
+            onSelectionChanged: (sel) async => _snack(await c.setMode(sel.first)),
+          ),
+        ),
+      ],
+    );
+  }
+
+
   Widget _controls(TripController c) {
     final cfg = c.config;
     return RvCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          _modeSelector(c),
+          const SizedBox(height: 14),
+          if (cfg.mode == TripMode.custom) ...[
+            const RvSectionTitle('Destino'),
+            DestinationPicker(
+              selected: cfg.customDestination,
+              enabled: !c.planning,
+              onSearch: c.searchPlaces,
+              onSelected: (p) async => _snack(await c.setCustomDestination(p)),
+            ),
+            if (c.planning)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text('Calculando ruta por carretera…',
+                    style: TextStyle(color: AppColors.textMuted, fontSize: 12)),
+              ),
+            const SizedBox(height: 16),
+          ],
+          if (cfg.mode == TripMode.corridor) ...[
           const RvSectionTitle('Sentido del viaje'),
           SizedBox(
             width: double.infinity,
@@ -279,6 +343,7 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
             ),
           ),
           const SizedBox(height: 16),
+          ],
           const RvSectionTitle('Intervalo de lectura'),
           Wrap(
             spacing: 8,

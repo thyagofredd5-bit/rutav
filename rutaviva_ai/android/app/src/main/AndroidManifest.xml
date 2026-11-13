@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Red -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -9,9 +10,10 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
-    <!-- Foreground Service (Android 14+: tipo "location" obligatorio) -->
+    <!-- Foreground Service (Android 14+: tipos mediaPlayback y location) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- Notificaciones (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -47,13 +49,27 @@
             </intent-filter>
         </activity>
 
-        <!-- Servicio en primer plano de flutter_foreground_task (tipo ubicación).
-             stopWithTask=false: sigue vivo aunque el usuario cierre la app desde recientes. -->
+        <!-- ÚNICO servicio en primer plano: reproductor MediaSession (audio_service).
+             mediaPlayback|location mantiene vivo el GPS en segundo plano y pinta la
+             notificación multimedia (One UI / pantalla de bloqueo). -->
         <service
-            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
-            android:foregroundServiceType="location"
-            android:exported="false"
-            android:stopWithTask="false" />
+            android:name="com.ryanheise.audioservice.AudioService"
+            android:foregroundServiceType="mediaPlayback|location"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
 
         <!-- Botones de la notificación (Actualizar / Finalizar) de flutter_local_notifications -->
         <receiver

@@ -17,13 +17,12 @@ bajo demanda con Gemini (con Google Search) y se guarda en caché local.
 3. Descarga `rutaviva-ai-apk` (contiene `app-release.apk`) desde los *Artifacts*.
 
 ## Compilar en local
-Requisitos: Flutter estable y Java 17.
+Requisitos: Flutter estable y Java 21.
 
 ```bash
-flutter create --project-name rutaviva_ai --org com.rutaviva --platforms=android /tmp/scaffold
+flutter create --platforms=android --org com.rutaviva --project-name ai /tmp/scaffold
+rm -f /tmp/scaffold/android/app/build.gradle.kts
 rsync -a --ignore-existing /tmp/scaffold/android/ android/
-rm -f android/app/build.gradle.kts
-rm -rf android/app/src/main/kotlin/com/rutaviva/rutaviva_ai
 flutter pub get
 flutter build apk --release
 ```
@@ -36,3 +35,21 @@ El APK queda en `build/app/outputs/flutter-apk/app-release.apk`.
 
 > El `applicationId` / namespace es `com.rutaviva.ai`. Cambia el correo del `User-Agent`
 > en `lib/core/app_constants.dart` por el tuyo (Wikimedia lo exige).
+
+## V2
+- Tarjeta Now Playing con foto real del pueblo, notificación multimedia con foto y progreso en km.
+- Fotos filtradas (Places → Wikipedia geosearch → Commons anti-basura → respaldo por zona).
+- Gemini con cascada automática de modelos (404/400) y reintento sin `google_search`.
+
+## Novedades V3
+
+- **Una sola notificación**: reproductor multimedia nativo (`audio_service`, `MediaSession`,
+  servicio `mediaPlayback|location`). Título `📍 Lugar (msnm)`, artista con destino/próximo pueblo,
+  foto del lugar como carátula y barra de progreso en kilómetros (1 s = 1 km, `speed: 0.0`).
+  Botones: ⏮ explorar el lugar actual · ⏸/▶ pausar o reanudar lecturas · ⏭ lectura GPS inmediata.
+- **Tres modos**: corredor Lima–Arequipa (offline), viaje a cualquier destino del Perú
+  (Nominatim + OSRM) y explorador libre «¿Dónde estoy?».
+- **Carga rápida**: fotos de Wikipedia es/en + Commons en paralelo (timeout 2.5 s), Gemini con JSON
+  directo (sin `google_search` por defecto), precarga en segundo plano del pueblo actual y el siguiente.
+- Requiere Flutter ≥ 3.27 (`audio_service` 0.18.18).
+- Nominatim y el servidor demo de OSRM son de uso justo: no los uses para tráfico masivo.

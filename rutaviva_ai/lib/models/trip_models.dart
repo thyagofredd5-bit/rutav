@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import '../core/app_constants.dart';
+import 'geo_models.dart';
 
 /// Qué disparó una lectura de ubicación.
 enum UpdateReason {
@@ -19,7 +20,7 @@ enum UpdateReason {
       );
 }
 
-/// Configuración del viaje activo (se comparte con el isolate del servicio).
+/// Configuración del viaje activo.
 class TripConfig {
   const TripConfig({
     required this.originId,
@@ -28,12 +29,33 @@ class TripConfig {
     this.updateOnSignalReturn = true,
     this.detectionRadiusKm = AppConstants.defaultDetectionRadiusKm,
     this.keepCpuAwake = false,
+    this.mode = TripMode.corridor,
+    this.customDestination,
   });
 
   static const TripConfig limaToArequipa =
       TripConfig(originId: 'lima-centro', destinationId: 'arequipa');
   static const TripConfig arequipaToLima =
       TripConfig(originId: 'arequipa', destinationId: 'lima-centro');
+
+  /// Explorador libre ("¿Dónde estoy?"): sin destino.
+  static const TripConfig free =
+      TripConfig(originId: 'gps', destinationId: 'free', mode: TripMode.free);
+
+  /// Viaje a cualquier destino del Perú (origen = GPS al iniciar).
+  factory TripConfig.toDestination(GeoPlace destination, {TripConfig? base}) {
+    final b = base ?? limaToArequipa;
+    return TripConfig(
+      originId: 'gps',
+      destinationId: 'custom:${destination.id}',
+      intervalMinutes: b.intervalMinutes,
+      updateOnSignalReturn: b.updateOnSignalReturn,
+      detectionRadiusKm: b.detectionRadiusKm,
+      keepCpuAwake: b.keepCpuAwake,
+      mode: TripMode.custom,
+      customDestination: destination,
+    );
+  }
 
   final String originId;
   final String destinationId;
@@ -45,14 +67,25 @@ class TripConfig {
   /// Radio para considerar que estás "en" un pueblo.
   final double detectionRadiusKm;
 
-  /// Mantiene la CPU despierta (wake lock): más preciso pero gasta más batería.
+  /// Reservado (el reproductor multimedia ya mantiene el proceso vivo).
   final bool keepCpuAwake;
 
-  bool get isValid =>
-      originId.isNotEmpty &&
-      destinationId.isNotEmpty &&
-      originId != destinationId &&
-      intervalMinutes >= 5;
+  final TripMode mode;
+  final GeoPlace? customDestination;
+
+  bool get isValid {
+    if (intervalMinutes < 5) return false;
+    switch (mode) {
+      case TripMode.corridor:
+        return originId.isNotEmpty &&
+            destinationId.isNotEmpty &&
+            originId != destinationId;
+      case TripMode.custom:
+        return customDestination != null;
+      case TripMode.free:
+        return true;
+    }
+  }
 
   TripConfig reversed() =>
       copyWith(originId: destinationId, destinationId: originId);
@@ -64,6 +97,8 @@ class TripConfig {
     bool? updateOnSignalReturn,
     double? detectionRadiusKm,
     bool? keepCpuAwake,
+    TripMode? mode,
+    GeoPlace? customDestination,
   }) =>
       TripConfig(
         originId: originId ?? this.originId,
@@ -72,6 +107,8 @@ class TripConfig {
         updateOnSignalReturn: updateOnSignalReturn ?? this.updateOnSignalReturn,
         detectionRadiusKm: detectionRadiusKm ?? this.detectionRadiusKm,
         keepCpuAwake: keepCpuAwake ?? this.keepCpuAwake,
+        mode: mode ?? this.mode,
+        customDestination: customDestination ?? this.customDestination,
       );
 
   Map<String, dynamic> toJson() => {
@@ -81,18 +118,29 @@ class TripConfig {
         'updateOnSignalReturn': updateOnSignalReturn,
         'detectionRadiusKm': detectionRadiusKm,
         'keepCpuAwake': keepCpuAwake,
+        'mode': mode.name,
+        'customDestination': customDestination?.toJson(),
       };
 
-  factory TripConfig.fromJson(Map<String, dynamic> json) => TripConfig(
-        originId: json['originId'] as String? ?? 'lima-centro',
-        destinationId: json['destinationId'] as String? ?? 'arequipa',
-        intervalMinutes: (json['intervalMinutes'] as num?)?.toInt() ??
-            AppConstants.defaultIntervalMinutes,
-        updateOnSignalReturn: json['updateOnSignalReturn'] as bool? ?? true,
-        detectionRadiusKm: (json['detectionRadiusKm'] as num?)?.toDouble() ??
-            AppConstants.defaultDetectionRadiusKm,
-        keepCpuAwake: json['keepCpuAwake'] as bool? ?? false,
-      );
+  factory TripConfig.fromJson(Map<String, dynamic> json) {
+    GeoPlace? dest;
+    final rawDest = json['customDestination'];
+    if (rawDest is Map) {
+      dest = GeoPlace.fromJson(Map<String, dynamic>.from(rawDest));
+    }
+    return TripConfig(
+      originId: json['originId'] as String? ?? 'lima-centro',
+      destinationId: json['destinationId'] as String? ?? 'arequipa',
+      intervalMinutes: (json['intervalMinutes'] as num?)?.toInt() ??
+          AppConstants.defaultIntervalMinutes,
+      updateOnSignalReturn: json['updateOnSignalReturn'] as bool? ?? true,
+      detectionRadiusKm: (json['detectionRadiusKm'] as num?)?.toDouble() ??
+          AppConstants.defaultDetectionRadiusKm,
+      keepCpuAwake: json['keepCpuAwake'] as bool? ?? false,
+      mode: TripMode.parse(json['mode'] as String?),
+      customDestination: dest,
+    );
+  }
 
   String encode() => jsonEncode(toJson());
 
@@ -123,6 +171,9 @@ class TripProgress {
     this.nextTownId,
     this.nextTownName,
     this.nextTownDistanceKm,
+    this.mode = TripMode.corridor,
+    this.place,
+    this.nextPlace,
   });
 
   final double latitude;
@@ -143,6 +194,12 @@ class TripProgress {
   final String? nextTownId;
   final String? nextTownName;
   final double? nextTownDistanceKm;
+
+  /// Modo con el que se calculó la lectura y, en modos dinámicos, los lugares
+  /// resueltos (Nominatim/offline) del punto actual y del siguiente.
+  final TripMode mode;
+  final GeoPlace? place;
+  final GeoPlace? nextPlace;
 
   /// 0.0 – 1.0
   final double progress;
@@ -185,9 +242,23 @@ class TripProgress {
         'arrived': arrived,
         'direction': direction,
         'computeMicros': computeMicros,
+        'mode': mode.name,
+        'place': place?.toJson(),
+        'nextPlace': nextPlace?.toJson(),
       };
 
-  factory TripProgress.fromJson(Map<String, dynamic> j) => TripProgress(
+  factory TripProgress.fromJson(Map<String, dynamic> j) {
+    GeoPlace? place;
+    final rawPlace = j['place'];
+    if (rawPlace is Map) {
+      place = GeoPlace.fromJson(Map<String, dynamic>.from(rawPlace));
+    }
+    GeoPlace? nextPlace;
+    final rawNext = j['nextPlace'];
+    if (rawNext is Map) {
+      nextPlace = GeoPlace.fromJson(Map<String, dynamic>.from(rawNext));
+    }
+    return TripProgress(
         latitude: (j['lat'] as num).toDouble(),
         longitude: (j['lng'] as num).toDouble(),
         originName: j['originName'] as String? ?? '',
@@ -209,7 +280,11 @@ class TripProgress {
         arrived: j['arrived'] as bool? ?? false,
         direction: (j['direction'] as num?)?.toInt() ?? 1,
         computeMicros: (j['computeMicros'] as num?)?.toInt() ?? 0,
+        mode: TripMode.parse(j['mode'] as String?),
+        place: place,
+        nextPlace: nextPlace,
       );
+  }
 }
 
 /// Lectura completa: análisis + metadatos de la lectura GPS.

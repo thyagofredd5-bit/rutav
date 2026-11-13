@@ -1,11 +1,11 @@
 name: rutaviva_ai
 description: "RutaViva AI - Copiloto de viaje por carretera con cobertura intermitente (Perú)."
 publish_to: "none"
-version: 2.0.0+2
+version: 3.0.0+3
 
 environment:
-  sdk: ">=3.4.0 <4.0.0"
-  flutter: ">=3.24.0"
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.27.0"
 
 dependencies:
   flutter:
@@ -14,8 +14,10 @@ dependencies:
   # Estado
   flutter_riverpod: ^2.6.1
 
-  # Segundo plano, ubicación, red y notificaciones
-  flutter_foreground_task: ^9.1.0
+  # Reproductor multimedia nativo (MediaSession) = único servicio en primer plano
+  audio_service: ^0.18.18
+
+  # Ubicación, red y notificaciones (solo aviso de llegada)
   flutter_local_notifications: ^19.4.2   # NO subir a ^20 (cambia la firma de show/initialize)
   geolocator: ^14.0.2
   connectivity_plus: ^6.1.4

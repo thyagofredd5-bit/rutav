@@ -27,7 +27,7 @@ class AppConstants {
   static const String actionStop = 'rv_action_stop';
 
   // ── Persistencia ───────────────────────────────────────────────────────
-  // Claves de FlutterForegroundTask.saveData (compartidas entre isolates).
+  // Claves de SharedPreferences del viaje activo.
   static const String keyTripConfig = 'rv_trip_config';
   static const String keyTripSnapshot = 'rv_trip_snapshot';
   // Claves de SharedPreferences (solo isolate principal).
@@ -51,13 +51,27 @@ class AppConstants {
   static const Duration llmTimeout = Duration(seconds: 60);
 
   /// Modelo Gemini por defecto y cascada de respaldo (se usa si hay HTTP 404/400).
-  static const String defaultGeminiModel = 'gemini-3.0-flash';
+  static const String defaultGeminiModel = 'gemini-3.8-flash';
   static const List<String> geminiFallbackModels = [
-    'gemini-3.0-flash',
     'gemini-3.8-flash',
+    'gemini-3.0-flash',
+    'gemini-3-flash-preview',
     'gemini-2.5-pro',
     'gemini-2.0-flash',
   ];
+
+  // ── V3: reproductor multimedia, ruteo y precarga ───────────────────────
+  static const String mediaChannelId = 'rutaviva_media_channel';
+  static const String mediaChannelName = 'RutaViva · Reproductor de viaje';
+  static const String keyActiveRoute = 'rv_active_route';
+  static const String nominatimHost = 'nominatim.openstreetmap.org';
+  static const String osrmHost = 'router.project-osrm.org';
+  /// Distancia por delante de la posición para anticipar el próximo pueblo.
+  static const double placeAheadKm = 20.0;
+  /// Radio para resolver el lugar actual con el JSON offline antes de Nominatim.
+  static const double offlinePlaceRadiusKm = 4.0;
+  /// Tiempo máximo de cada fuente de fotos (Wikipedia es/en y Commons en paralelo).
+  static const Duration photoSourceTimeout = Duration(milliseconds: 2500);
 
   /// Wikimedia exige un User-Agent identificable con contacto. Cámbialo por el tuyo.
   static const String httpUserAgent =

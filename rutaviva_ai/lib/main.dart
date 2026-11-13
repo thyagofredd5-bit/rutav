@@ -7,6 +7,7 @@ import 'core/app_theme.dart';
 import 'providers/trip_provider.dart';
 import 'screens/home_trip_screen.dart';
 import 'services/background_trip_service.dart';
+import 'services/trip_media_handler.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,9 +20,10 @@ Future<void> main() async {
   ));
 
   try {
-    // Notificaciones + puerto de comunicación con el servicio en 2º plano.
+    // Reproductor multimedia (MediaSession) = único servicio en primer plano.
+    final media = await initTripMediaHandler();
     await BackgroundTripService.initialize();
-    final controller = await TripController.create();
+    final controller = await TripController.create(media: media);
     runApp(ProviderScope(
       overrides: [tripProvider.overrideWith((ref) => controller)],
       child: const RutaVivaApp(),

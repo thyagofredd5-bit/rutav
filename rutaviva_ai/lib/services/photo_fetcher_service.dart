@@ -98,24 +98,25 @@ class PhotoFetcherService {
       }
     }
 
+    // V3: Places (si hay clave), Wikipedia es/en y Commons corren EN PARALELO;
+    // cada fuente tiene su propio timeout (2.5 s) y el orden de prioridad se
+    // conserva al combinar los resultados.
     final key = placesApiKey.trim();
-    // Prioridad 1: Google Places.
-    if (key.isNotEmpty) {
-      add(await _safeList(() => _placesTouristPhotos(town, key)));
-    }
-    // Prioridad 2: Wikipedia geosearch (es + en).
-    if (out.length < maxPhotos) {
-      final geo = await Future.wait<List<TownPhoto>>([
-        _safeList(() => _wikipediaGeoPhotos(town, 'es')),
-        _safeList(() => _wikipediaGeoPhotos(town, 'en')),
-      ]);
-      for (final l in geo) {
-        add(l);
-      }
-    }
-    // Prioridad 3: Commons filtrado.
-    if (out.length < 3) {
-      add(await _safeList(() => _commonsSearchPhotos(town)));
+    Future<List<TownPhoto>> raced(Future<List<TownPhoto>> Function() f,
+            {Duration? timeout}) =>
+        _safeList(f).timeout(timeout ?? AppConstants.photoSourceTimeout,
+            onTimeout: () => const <TownPhoto>[]);
+
+    final results = await Future.wait<List<TownPhoto>>([
+      if (key.isNotEmpty)
+        raced(() => _placesTouristPhotos(town, key),
+            timeout: const Duration(seconds: 6)),
+      raced(() => _wikipediaGeoPhotos(town, 'es')),
+      raced(() => _wikipediaGeoPhotos(town, 'en')),
+      raced(() => _commonsSearchPhotos(town)),
+    ]);
+    for (final l in results) {
+      add(l);
     }
     // Prioridad 4: respaldo por zona geográfica.
     if (out.isEmpty) {

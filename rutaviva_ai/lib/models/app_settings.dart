@@ -30,7 +30,7 @@ class AppSettings {
     this.llmModel = '',
     this.openAiBaseUrl = 'https://api.openai.com/v1',
     this.placesApiKey = '',
-    this.useWebGrounding = true,
+    this.useWebGrounding = false,
   });
 
   final LlmProvider provider;
@@ -91,7 +91,7 @@ class AppSettings {
         openAiBaseUrl:
             j['openAiBaseUrl'] as String? ?? 'https://api.openai.com/v1',
         placesApiKey: j['placesApiKey'] as String? ?? '',
-        useWebGrounding: j['useWebGrounding'] as bool? ?? true,
+        useWebGrounding: j['useWebGrounding'] as bool? ?? false,
       );
 }
 

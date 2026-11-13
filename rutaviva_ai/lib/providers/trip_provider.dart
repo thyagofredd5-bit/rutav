@@ -2,11 +2,13 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/ai_town_guide.dart';
 import '../models/app_settings.dart';
+import '../models/geo_models.dart';
 import '../models/town_model.dart';
 import '../models/trip_models.dart';
 import '../services/ai_explorer_service.dart';
@@ -14,6 +16,8 @@ import '../services/background_trip_service.dart';
 import '../services/offline_geocoder_service.dart';
 import '../services/permission_service.dart';
 import '../services/photo_fetcher_service.dart';
+import '../services/routing_service.dart';
+import '../services/trip_media_handler.dart';
 
 /// Se sobreescribe en `main()` con el controlador ya inicializado.
 final tripProvider = ChangeNotifierProvider<TripController>(
@@ -28,12 +32,25 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
     required this.geocoder,
     required this.settingsRepo,
     required this.ai,
+    required this.media,
   });
 
   final SharedPreferences prefs;
   final OfflineGeocoderService geocoder;
   final SettingsRepository settingsRepo;
   final AiExplorerService ai;
+  final TripMediaHandler media;
+
+  /// Búsqueda de destinos (Nominatim) y ruteo (OSRM).
+  late final NominatimService nominatim = NominatimService();
+  late final PlaceResolver _resolver =
+      PlaceResolver(geocoder: geocoder, nominatim: nominatim);
+  final OsrmService _osrm = OsrmService();
+
+  /// Ruta por carretera del viaje a destino libre en curso.
+  RoutePlan? plannedRoute;
+  bool planning = false;
+  final Set<String> _prefetched = {};
 
   AppSettings settings = const AppSettings();
   TripConfig config = TripConfig.limaToArequipa;
@@ -47,7 +64,7 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
 
   // ── Construcción ───────────────────────────────────────────────────────
 
-  static Future<TripController> create() async {
+  static Future<TripController> create({required TripMediaHandler media}) async {
     final prefs = await SharedPreferences.getInstance();
     final geocoder = await OfflineGeocoderService.loadFromAssets();
     final controller = TripController(
@@ -55,6 +72,7 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
       geocoder: geocoder,
       settingsRepo: SettingsRepository(prefs),
       ai: AiExplorerService(prefs: prefs, photoFetcher: PhotoFetcherService()),
+      media: media,
     );
     await controller.init();
     return controller;
@@ -65,23 +83,150 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
     final isRunning = await BackgroundTripService.refreshRunningState();
     final active = isRunning ? await BackgroundTripService.loadActiveConfig() : null;
     var cfg = active ?? settingsRepo.loadTripDefaults();
-    if (geocoder.byId(cfg.originId) == null ||
-        geocoder.byId(cfg.destinationId) == null ||
-        !cfg.isValid) {
+    final corridorOk = geocoder.byId(cfg.originId) != null &&
+        geocoder.byId(cfg.destinationId) != null;
+    if (cfg.mode == TripMode.corridor && (!corridorOk || !cfg.isValid)) {
       cfg = TripConfig.limaToArequipa;
+    } else if (cfg.mode == TripMode.free) {
+      cfg = TripConfig.free.copyWith(
+          intervalMinutes: cfg.intervalMinutes,
+          updateOnSignalReturn: cfg.updateOnSignalReturn,
+          detectionRadiusKm: cfg.detectionRadiusKm);
     }
     config = cfg;
     try {
       permissions = await PermissionService.check();
     } catch (_) {}
 
-    BackgroundTripService.latestSnapshot.addListener(_onBackground);
+    // Botones del reproductor multimedia (notificación / pantalla de bloqueo).
+    media.onRefreshRequested = () async {
+      await BackgroundTripService.requestImmediateUpdate();
+    };
+    media.onPauseRequested = () async => BackgroundTripService.pauseTracking();
+    media.onResumeRequested = () async => BackgroundTripService.resumeTracking();
+    media.onStopRequested = () async {
+      await BackgroundTripService.stopTrip();
+    };
+    media.onExploreRequested = () async {
+      BackgroundTripService.exploreRequests.value =
+          ExploreRequest(townId: currentTown.id, at: DateTime.now());
+    };
+
+    BackgroundTripService.latestSnapshot.addListener(_onSnapshotChanged);
     BackgroundTripService.lastError.addListener(_onBackground);
-    BackgroundTripService.isRunning.addListener(_onBackground);
+    BackgroundTripService.isRunning.addListener(_onRunningChanged);
+    BackgroundTripService.isPaused.addListener(_onPausedChanged);
     WidgetsBinding.instance.addObserver(this);
   }
 
   void _onBackground() => notifyListeners();
+
+  void _onRunningChanged() {
+    notifyListeners();
+    if (!running) unawaited(media.showStopped());
+  }
+
+  void _onPausedChanged() {
+    notifyListeners();
+    _syncMedia();
+  }
+
+  void _onSnapshotChanged() {
+    notifyListeners();
+    if (!running || snapshot == null) return;
+    _syncMedia();
+    final cur = currentTown;
+    final nxt = nextTown;
+    if (hasRealPlace) {
+      ensureHero(cur);
+      _prefetch(cur);
+    }
+    if (nxt != null) {
+      ensureHero(nxt);
+      _prefetch(nxt);
+    }
+  }
+
+  /// Pre-carga de fotos + ficha IA del pueblo actual y del siguiente.
+  void _prefetch(TownModel t) {
+    if (!settings.hasLlmKey || _prefetched.contains(t.id)) return;
+    _prefetched.add(t.id);
+    unawaited(ai
+        .prefetch(t, settings: settings, tripContext: _tripContext())
+        .then((ok) {
+      if (!ok) _prefetched.remove(t.id);
+    }));
+  }
+
+  // ── Reproductor multimedia ─────────────────────────────────────────────
+
+  String _thousands(int n) {
+    final s = n.toString();
+    final b = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) b.write(',');
+      b.write(s[i]);
+    }
+    return b.toString();
+  }
+
+  /// Foto de respaldo inmediata mientras responden Wikipedia/Commons.
+  String _fallbackArt(int? altitudeM) =>
+      'https://picsum.photos/seed/rutaviva_${altitudeM ?? 0}/1000/600';
+
+  Future<void> _publishStarting() {
+    final plan = plannedRoute;
+    return media.publish(
+      placeId: 'rutaviva-start',
+      title: '📍 Obteniendo ubicación…',
+      artist: mode == TripMode.free
+          ? 'Explorando alrededor tuyo'
+          : 'Rumbo a $destinationLabel',
+      kmTotal: plan?.totalKm ?? 0,
+      kmTraveled: 0,
+      artUrl: _fallbackArt(null),
+      paused: false,
+    );
+  }
+
+  void _syncMedia() {
+    if (!running) return;
+    final s = snapshot;
+    if (s == null) return;
+    final p = s.progress;
+    final town = currentTown;
+    final alt = p.place?.altitudeM ?? (town.msnm > 0 ? town.msnm : null);
+    final title = (alt != null && alt > 0)
+        ? '📍 ${town.nombreLugar} (${_thousands(alt)} msnm)'
+        : '📍 ${town.nombreLugar}';
+
+    String artist;
+    if (mode == TripMode.free) {
+      final parts = <String>[];
+      for (final v in [town.provincia, town.departamento]) {
+        final t = v.trim();
+        if (t.isNotEmpty && !parts.contains(t)) parts.add(t);
+      }
+      artist = 'Explorando ${parts.isEmpty ? town.nombre : parts.join(', ')}';
+    } else {
+      final nxt = nextTown;
+      final nextName = nxt == null ? 'destino' : nxt.nombreLugar;
+      final km = p.nextTownDistanceKm;
+      final kmTxt = km == null ? '' : ' (${km.round()} km)';
+      artist = 'Rumbo a $destinationLabel • Próx: $nextName$kmTxt';
+    }
+
+    final art = heroFor(town)?.url ?? _fallbackArt(alt);
+    unawaited(media.publish(
+      placeId: town.id,
+      title: title,
+      artist: artist,
+      kmTotal: p.kmTotal,
+      kmTraveled: p.kmTraveled,
+      artUrl: art,
+      paused: BackgroundTripService.isPaused.value,
+    ));
+  }
 
   @override
   void notifyListeners() {
@@ -108,35 +253,126 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
   // ── Lecturas derivadas ─────────────────────────────────────────────────
 
   bool get running => BackgroundTripService.isRunning.value;
+  bool get paused => BackgroundTripService.isPaused.value;
   String? get serviceError => BackgroundTripService.lastError.value;
+  TripMode get mode => config.mode;
   bool get isForward => config.originId == TripConfig.limaToArequipa.originId;
 
-  TownModel get originTown => geocoder.requireById(config.originId);
-  TownModel get destinationTown => geocoder.requireById(config.destinationId);
-  String get routeLabel =>
-      '${originTown.nombreLugar} a ${destinationTown.nombreLugar}';
+  TownModel get originTown => geocoder.byId(config.originId) ??
+      geocoder.requireById(TripConfig.limaToArequipa.originId);
+  TownModel get destinationTown => geocoder.byId(config.destinationId) ??
+      geocoder.requireById(TripConfig.limaToArequipa.destinationId);
 
-  /// Última lectura, solo si pertenece a la ruta/sentido actualmente elegidos.
+  String get originLabel {
+    switch (mode) {
+      case TripMode.corridor:
+        return originTown.nombreLugar;
+      case TripMode.custom:
+        return plannedRoute?.origin.name ?? 'Mi ubicación';
+      case TripMode.free:
+        return 'Mi ubicación';
+    }
+  }
+
+  String get destinationLabel {
+    switch (mode) {
+      case TripMode.corridor:
+        return destinationTown.nombreLugar;
+      case TripMode.custom:
+        return config.customDestination?.name ?? '';
+      case TripMode.free:
+        return '';
+    }
+  }
+
+  String get routeLabel {
+    if (mode == TripMode.free) return 'Exploración libre';
+    return '$originLabel a $destinationLabel';
+  }
+
+  /// Distancia total de la ruta en km (0 en modo libre).
+  double get totalKm {
+    switch (mode) {
+      case TripMode.corridor:
+        return (destinationTown.kmRuta - originTown.kmRuta).abs();
+      case TripMode.custom:
+        return snapshot?.progress.kmTotal ?? plannedRoute?.totalKm ?? 0;
+      case TripMode.free:
+        return 0;
+    }
+  }
+
+  /// `false` mientras no hay lugar resuelto en modos dinámicos (evita buscar
+  /// fotos de un lugar ficticio).
+  bool get hasRealPlace =>
+      mode == TripMode.corridor || snapshot?.progress.place != null;
+
+  /// Última lectura, solo si pertenece a la ruta/modo actualmente elegidos.
   TripSnapshot? get snapshot {
     final s = BackgroundTripService.latestSnapshot.value;
     if (s == null) return null;
-    final o = geocoder.byId(config.originId);
-    final d = geocoder.byId(config.destinationId);
-    if (o == null || d == null) return null;
-    if (s.progress.originName != o.nombreLugar ||
-        s.progress.destinationName != d.nombreLugar) {
-      return null;
+    if (s.progress.mode != config.mode) return null;
+    switch (config.mode) {
+      case TripMode.corridor:
+        final o = geocoder.byId(config.originId);
+        final d = geocoder.byId(config.destinationId);
+        if (o == null || d == null) return null;
+        if (s.progress.originName != o.nombreLugar ||
+            s.progress.destinationName != d.nombreLugar) {
+          return null;
+        }
+        return s;
+      case TripMode.custom:
+        final dest = config.customDestination;
+        if (dest == null || s.progress.destinationName != dest.name) return null;
+        return s;
+      case TripMode.free:
+        return s;
     }
-    return s;
+  }
+
+  static const TownModel _placeholderTown = TownModel(
+    id: 'geo:ubicacion-actual',
+    orden: 0,
+    nombre: 'Mi ubicación',
+    provincia: '',
+    departamento: '',
+    lat: -12.0464,
+    lng: -77.0428,
+    msnm: 0,
+    kmRuta: 0,
+    tipo: TownType.distrito,
+    etiqueta: '',
+    enRutaPrincipal: false,
+    desvioKm: 0,
+    wikipedia: null,
+  );
+
+  TownModel _townFromPlace(GeoPlace pl) {
+    if (pl.townId != null) {
+      final t = geocoder.byId(pl.townId!);
+      if (t != null) return t;
+    }
+    return pl.toTownModel();
   }
 
   TownModel get currentTown {
-    final id = snapshot?.progress.currentTownId;
-    return (id != null ? geocoder.byId(id) : null) ?? originTown;
+    final p = snapshot?.progress;
+    if (p != null) {
+      final pl = p.place;
+      if (pl != null) return _townFromPlace(pl);
+      final t = geocoder.byId(p.currentTownId);
+      if (t != null) return t;
+    }
+    return mode == TripMode.corridor ? originTown : _placeholderTown;
   }
 
   TownModel? get nextTown {
-    final id = snapshot?.progress.nextTownId;
+    final p = snapshot?.progress;
+    final np = p?.nextPlace;
+    if (np != null) return _townFromPlace(np);
+    if (mode != TripMode.corridor) return null;
+    final id = p?.nextTownId;
     if (id != null) return geocoder.byId(id);
     for (final stop in timeline) {
       if (stop.status == TownStatus.upcoming && stop.town.enRutaPrincipal) {
@@ -146,8 +382,19 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
     return null;
   }
 
-  List<RouteStop> get timeline =>
-      geocoder.buildTimeline(config, progress: snapshot?.progress);
+  /// Resuelve un id (localidad del JSON o lugar dinámico del viaje actual).
+  TownModel? townForId(String? id) {
+    if (id == null) return null;
+    final cur = currentTown;
+    if (cur.id == id) return cur;
+    final nxt = nextTown;
+    if (nxt != null && nxt.id == id) return nxt;
+    return geocoder.byId(id);
+  }
+
+  List<RouteStop> get timeline => mode == TripMode.corridor
+      ? geocoder.buildTimeline(config, progress: snapshot?.progress)
+      : const <RouteStop>[];
 
   String _tripContext() {
     final p = snapshot?.progress;
@@ -168,27 +415,114 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
         return null;
       }
       await settingsRepo.saveTripDefaults(config);
-      final result = await BackgroundTripService.startTrip(config);
-      return result.success ? null : result.message;
+      return await _startWith(config);
     } finally {
       starting = false;
       await refreshPermissions();
     }
   }
 
-  /// Cambia sentido/intervalo/señal; si hay viaje activo lo reinicia.
+  /// Arranca el seguimiento; en modo `custom` calcula antes la ruta OSRM.
+  Future<String?> _startWith(TripConfig cfg) async {
+    RoutePlan? plan;
+    if (cfg.mode == TripMode.custom) {
+      final dest = cfg.customDestination;
+      if (dest == null) return 'Elige un destino para iniciar el viaje.';
+      final perms = await PermissionService.check();
+      if (!perms.canRunTrip) {
+        return 'Faltan requisitos: ${perms.missingForTrip.join(', ')}.';
+      }
+      planning = true;
+      notifyListeners();
+      try {
+        final origin = await _currentPlace();
+        if (origin == null) {
+          return 'No se pudo obtener tu ubicación actual. Activa el GPS e inténtalo de nuevo.';
+        }
+        plan = await _osrm.route(origin: origin, destination: dest);
+      } on RoutingException catch (e) {
+        return e.message;
+      } finally {
+        planning = false;
+        notifyListeners();
+      }
+    }
+    plannedRoute = plan;
+    final result = await BackgroundTripService.startTrip(cfg, plan: plan);
+    if (!result.success) return result.message;
+    await _publishStarting();
+    return null;
+  }
+
+  Future<GeoPlace?> _currentPlace() async {
+    try {
+      Position? pos;
+      try {
+        pos = await Geolocator.getCurrentPosition(
+          locationSettings: AndroidSettings(
+            accuracy: LocationAccuracy.medium,
+            timeLimit: const Duration(seconds: 25),
+          ),
+        );
+      } catch (_) {
+        pos = await Geolocator.getLastKnownPosition();
+      }
+      if (pos == null) return null;
+      final place = await _resolver.resolve(pos.latitude, pos.longitude,
+          altitudeM: pos.altitude > 0 ? pos.altitude : null);
+      return place.copyWith(lat: pos.latitude, lng: pos.longitude);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Cambia modo/sentido/intervalo/señal; si hay viaje activo lo reinicia.
   Future<String?> updateConfig(TripConfig next) async {
-    if (!next.isValid) return 'Configuración de viaje inválida.';
+    if (!next.isValid && next.mode != TripMode.custom) {
+      return 'Configuración de viaje inválida.';
+    }
     config = next;
     await settingsRepo.saveTripDefaults(next);
     notifyListeners();
     if (running) {
-      final result = await BackgroundTripService.startTrip(next);
+      if (!next.isValid) {
+        await BackgroundTripService.stopTrip();
+        return null;
+      }
+      final r = await _startWith(next);
       notifyListeners();
-      return result.success ? null : result.message;
+      return r;
     }
     return null;
   }
+
+  Future<String?> setMode(TripMode m) {
+    switch (m) {
+      case TripMode.corridor:
+        final needsIds = config.originId == 'gps';
+        return updateConfig(config.copyWith(
+          mode: TripMode.corridor,
+          originId: needsIds ? TripConfig.limaToArequipa.originId : config.originId,
+          destinationId:
+              needsIds ? TripConfig.limaToArequipa.destinationId : config.destinationId,
+        ));
+      case TripMode.custom:
+        final dest = config.customDestination;
+        return updateConfig(config.copyWith(
+          mode: TripMode.custom,
+          originId: 'gps',
+          destinationId: dest == null ? 'custom' : 'custom:${dest.id}',
+        ));
+      case TripMode.free:
+        return updateConfig(
+            config.copyWith(mode: TripMode.free, originId: 'gps', destinationId: 'free'));
+    }
+  }
+
+  Future<String?> setCustomDestination(GeoPlace place) =>
+      updateConfig(TripConfig.toDestination(place, base: config));
+
+  Future<List<GeoPlace>> searchPlaces(String query) => nominatim.search(query);
 
   Future<String?> refreshNow() async {
     final ok = await BackgroundTripService.requestImmediateUpdate();
@@ -284,6 +618,7 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
     }
     _hero.clear();
     _heroPending.clear();
+    _prefetched.clear();
     _guides.clear();
     notifyListeners();
   }
@@ -349,6 +684,7 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
       _hero[t.id] = pick;
       _heroPending.remove(t.id);
       notifyListeners();
+      if (running && currentTown.id == t.id) _syncMedia();
     } else {
       // Sin datos: reintentar más tarde (no en cada redibujado).
       Future<void>.delayed(
@@ -410,9 +746,12 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
   void dispose() {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
-    BackgroundTripService.latestSnapshot.removeListener(_onBackground);
+    BackgroundTripService.latestSnapshot.removeListener(_onSnapshotChanged);
     BackgroundTripService.lastError.removeListener(_onBackground);
-    BackgroundTripService.isRunning.removeListener(_onBackground);
+    BackgroundTripService.isRunning.removeListener(_onRunningChanged);
+    BackgroundTripService.isPaused.removeListener(_onPausedChanged);
+    _resolver.dispose();
+    _osrm.dispose();
     for (final s in _subs.values) {
       s.cancel();
     }
