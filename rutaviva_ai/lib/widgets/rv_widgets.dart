@@ -1,6 +1,9 @@
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/material.dart';
 import 'package:shimmer/shimmer.dart';
 
+import '../core/app_constants.dart';
 import '../core/app_theme.dart';
 import '../services/permission_service.dart';
 
@@ -117,28 +120,34 @@ class RvStatusCard extends StatelessWidget {
   }
 }
 
-/// Barra de progreso estilo reproductor de Spotify (pista fina + perilla).
+/// Barra de progreso estilo reproductor de Spotify (pista + perilla brillante).
 class RvProgressBar extends StatelessWidget {
   const RvProgressBar({
     super.key,
     required this.progress,
     this.leftLabel,
     this.rightLabel,
+    this.color = AppColors.accent,
+    this.trackHeight = 4,
+    this.glow = false,
   });
 
   final double progress;
   final String? leftLabel;
   final String? rightLabel;
+  final Color color;
+  final double trackHeight;
+  final bool glow;
 
   @override
   Widget build(BuildContext context) {
     final p = progress.isNaN ? 0.0 : progress.clamp(0.0, 1.0);
-    const thumb = 14.0;
+    final thumb = trackHeight + 10;
     const anim = Duration(milliseconds: 700);
     return Column(
       children: [
         SizedBox(
-          height: 18,
+          height: thumb + 4,
           child: LayoutBuilder(builder: (context, cons) {
             final w = cons.maxWidth;
             final travel = (w - thumb) * p;
@@ -146,20 +155,20 @@ class RvProgressBar extends StatelessWidget {
               alignment: Alignment.centerLeft,
               children: [
                 Container(
-                  height: 4,
+                  height: trackHeight,
                   decoration: BoxDecoration(
-                    color: AppColors.outline,
-                    borderRadius: BorderRadius.circular(2),
+                    color: AppColors.alpha(Colors.white, 0.22),
+                    borderRadius: BorderRadius.circular(trackHeight),
                   ),
                 ),
                 AnimatedContainer(
                   duration: anim,
                   curve: Curves.easeOutCubic,
-                  height: 4,
+                  height: trackHeight,
                   width: travel + thumb / 2,
                   decoration: BoxDecoration(
-                    color: AppColors.accent,
-                    borderRadius: BorderRadius.circular(2),
+                    color: color,
+                    borderRadius: BorderRadius.circular(trackHeight),
                   ),
                 ),
                 AnimatedPositioned(
@@ -169,9 +178,17 @@ class RvProgressBar extends StatelessWidget {
                   child: Container(
                     width: thumb,
                     height: thumb,
-                    decoration: const BoxDecoration(
-                      color: AppColors.textPrimary,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
                       shape: BoxShape.circle,
+                      boxShadow: glow
+                          ? [
+                              BoxShadow(
+                                  color: AppColors.alpha(color, 0.85),
+                                  blurRadius: 12,
+                                  spreadRadius: 1),
+                            ]
+                          : null,
                     ),
                   ),
                 ),
@@ -186,8 +203,8 @@ class RvProgressBar extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(leftLabel ?? '',
-                    style: const TextStyle(
-                        color: AppColors.accent,
+                    style: TextStyle(
+                        color: color,
                         fontSize: 12,
                         fontWeight: FontWeight.w700)),
                 Text(rightLabel ?? '',
@@ -432,6 +449,330 @@ class RvPermissionBanner extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Tarjeta "Now Playing" estilo Spotify con foto real de fondo
+// ═════════════════════════════════════════════════════════════════════════
+
+class RvNowPlayingCard extends StatelessWidget {
+  const RvNowPlayingCard({
+    super.key,
+    required this.imageUrl,
+    required this.pillText,
+    required this.running,
+    required this.townName,
+    required this.subtitle,
+    required this.statusText,
+    required this.nextLabel,
+    required this.nextDetail,
+    required this.destinationDetail,
+    required this.progress,
+    required this.leftLabel,
+    required this.rightLabel,
+    required this.footer,
+    this.warnings = const <String>[],
+    this.onTap,
+  });
+
+  final String? imageUrl;
+  final String pillText;
+  final bool running;
+  final String townName;
+  final String subtitle;
+  final String statusText;
+  final String nextLabel;
+  final String nextDetail;
+  final String destinationDetail;
+  final double progress;
+  final String leftLabel;
+  final String rightLabel;
+  final String footer;
+  final List<String> warnings;
+  final VoidCallback? onTap;
+
+  static const Color _bottom = Color(0xFF0A0E14);
+
+  Widget _background() {
+    final url = imageUrl;
+    if (url == null || url.isEmpty) {
+      return Container(
+        key: const ValueKey('rv-bg-none'),
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [AppColors.accentDeep, _bottom],
+          ),
+        ),
+      );
+    }
+    return Image.network(
+      url,
+      key: ValueKey(url),
+      fit: BoxFit.cover,
+      gaplessPlayback: true,
+      headers: const {'User-Agent': AppConstants.httpUserAgent},
+      errorBuilder: (_, __, ___) => Container(color: AppColors.accentDeep),
+      loadingBuilder: (context, child, loading) =>
+          loading == null ? child : Container(color: AppColors.accentDeep),
+    );
+  }
+
+  Widget _glass({
+    required Widget child,
+    required double radius,
+    required EdgeInsets padding,
+  }) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+        child: Container(
+          padding: padding,
+          decoration: BoxDecoration(
+            color: AppColors.alpha(Colors.white, 0.14),
+            borderRadius: BorderRadius.circular(radius),
+            border: Border.all(color: AppColors.alpha(Colors.white, 0.22)),
+          ),
+          child: child,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: GestureDetector(
+        onTap: onTap,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 800),
+                  switchInCurve: Curves.easeOut,
+                  child: SizedBox.expand(
+                    key: ValueKey(imageUrl ?? 'none'),
+                    child: _background(),
+                  ),
+                ),
+              ),
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        AppColors.alpha(Colors.black, 0.25),
+                        AppColors.alpha(_bottom, 0.6),
+                        _bottom,
+                      ],
+                      stops: const [0.0, 0.5, 0.88],
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: _glass(
+                        radius: 999,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 8),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: running
+                                    ? AppColors.spotify
+                                    : AppColors.textMuted,
+                                boxShadow: running
+                                    ? [
+                                        BoxShadow(
+                                            color: AppColors.alpha(
+                                                AppColors.spotify, 0.9),
+                                            blurRadius: 8)
+                                      ]
+                                    : null,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: Text(
+                                pillText,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 0.8,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 130),
+                    Text(
+                      townName,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 40,
+                        fontWeight: FontWeight.w900,
+                        height: 1.02,
+                        shadows: [
+                          Shadow(
+                              blurRadius: 16,
+                              color: AppColors.alpha(Colors.black, 0.6)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(subtitle,
+                        style: const TextStyle(
+                            color: Colors.white70, fontSize: 16)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(Icons.near_me_rounded,
+                            size: 14, color: AppColors.spotify),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(statusText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: AppColors.spotify,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    _glass(
+                      radius: 18,
+                      padding: const EdgeInsets.all(14),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 44,
+                            height: 44,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: AppColors.alpha(AppColors.spotify, 0.22),
+                            ),
+                            child: const Icon(Icons.explore_rounded,
+                                color: AppColors.spotify),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('PRÓXIMO DESTINO',
+                                    style: TextStyle(
+                                        color: Colors.white60,
+                                        fontSize: 10,
+                                        letterSpacing: 1.2,
+                                        fontWeight: FontWeight.w700)),
+                                const SizedBox(height: 2),
+                                Text('$nextLabel • $nextDetail',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w800)),
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    const Icon(Icons.route_rounded,
+                                        size: 14, color: Colors.white60),
+                                    const SizedBox(width: 6),
+                                    Expanded(
+                                      child: Text(destinationDetail,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 12)),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    RvProgressBar(
+                      progress: progress,
+                      leftLabel: leftLabel,
+                      rightLabel: rightLabel,
+                      color: AppColors.spotify,
+                      trackHeight: 8,
+                      glow: true,
+                    ),
+                    const SizedBox(height: 10),
+                    for (final w in warnings)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Icon(Icons.info_outline_rounded,
+                                size: 15, color: AppColors.amber),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(w,
+                                  style: const TextStyle(
+                                      color: AppColors.amber, fontSize: 12)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    Text(footer,
+                        style: const TextStyle(
+                            color: Colors.white60, fontSize: 12)),
+                    const SizedBox(height: 4),
+                    const Row(
+                      children: [
+                        Icon(Icons.touch_app_rounded,
+                            size: 14, color: Colors.white54),
+                        SizedBox(width: 6),
+                        Text('Toca para explorar este pueblo',
+                            style:
+                                TextStyle(color: Colors.white54, fontSize: 12)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

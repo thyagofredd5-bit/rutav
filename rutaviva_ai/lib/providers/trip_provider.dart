@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -113,7 +114,7 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
   TownModel get originTown => geocoder.requireById(config.originId);
   TownModel get destinationTown => geocoder.requireById(config.destinationId);
   String get routeLabel =>
-      '${originTown.nombreLugar} ➔ ${destinationTown.nombreLugar}';
+      '${originTown.nombreLugar} a ${destinationTown.nombreLugar}';
 
   /// Última lectura, solo si pertenece a la ruta/sentido actualmente elegidos.
   TripSnapshot? get snapshot {
@@ -278,8 +279,81 @@ class TripController extends ChangeNotifier with WidgetsBindingObserver {
     }
     _subs.clear();
     await ai.clearCache();
+    for (final k in prefs.getKeys().where((k) => k.startsWith(_heroPrefix)).toList()) {
+      await prefs.remove(k);
+    }
+    _hero.clear();
+    _heroPending.clear();
     _guides.clear();
     notifyListeners();
+  }
+
+  // ── Foto de fondo del pueblo actual (tarjeta "Now Playing") ─────────────
+
+  static const String _heroPrefix = 'rv_hero_v2_';
+  static const Duration _heroTtl = Duration(days: 30);
+  final Map<String, TownPhoto> _hero = {};
+  final Set<String> _heroPending = {};
+
+  TownPhoto? heroFor(TownModel t) => _hero[t.id];
+
+  void ensureHero(TownModel t) {
+    if (_hero.containsKey(t.id) || _heroPending.contains(t.id)) return;
+    _heroPending.add(t.id);
+    unawaited(_loadHero(t));
+  }
+
+  TownPhoto? _pickHero(List<TownPhoto> photos) {
+    if (photos.isEmpty) return null;
+    for (final p in photos) {
+      final w = p.width ?? 0;
+      final h = p.height ?? 0;
+      if (w > 0 && h > 0 && w >= h * 1.2) return p;
+    }
+    return photos.first;
+  }
+
+  Future<void> _loadHero(TownModel t) async {
+    TownPhoto? pick;
+    try {
+      final key = '$_heroPrefix${t.id}';
+      final raw = prefs.getString(key);
+      if (raw != null) {
+        try {
+          final j = jsonDecode(raw) as Map<String, dynamic>;
+          final at = DateTime.tryParse(j['at'] as String? ?? '');
+          if (at != null &&
+              DateTime.now().difference(at) < _heroTtl &&
+              j['photo'] is Map) {
+            pick = TownPhoto.fromJson(
+                Map<String, dynamic>.from(j['photo'] as Map));
+          }
+        } catch (_) {}
+      }
+      if (pick == null) {
+        final photos =
+            await ai.fetchPhotos(t, placesApiKey: settings.placesApiKey);
+        pick = _pickHero(photos);
+        if (pick != null) {
+          await prefs.setString(
+              key,
+              jsonEncode({
+                'at': DateTime.now().toIso8601String(),
+                'photo': pick.toJson(),
+              }));
+        }
+      }
+    } catch (_) {}
+
+    if (pick != null) {
+      _hero[t.id] = pick;
+      _heroPending.remove(t.id);
+      notifyListeners();
+    } else {
+      // Sin datos: reintentar más tarde (no en cada redibujado).
+      Future<void>.delayed(
+          const Duration(minutes: 5), () => _heroPending.remove(t.id));
+    }
   }
 
   // ── Fichas IA por pueblo ───────────────────────────────────────────────

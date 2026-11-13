@@ -7,7 +7,7 @@ import 'trip_models.dart';
 
 /// Proveedor de LLM configurable desde la UI.
 enum LlmProvider {
-  gemini('Google Gemini', 'gemini-2.5-flash'),
+  gemini('Google Gemini', AppConstants.defaultGeminiModel),
   openai('OpenAI / compatible', 'gpt-4o-mini'),
   anthropic('Anthropic Claude', 'claude-haiku-5-5');
 

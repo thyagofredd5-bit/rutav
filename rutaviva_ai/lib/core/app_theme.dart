@@ -10,6 +10,8 @@ class AppColors {
   static const Color surfaceHigh = Color(0xFF16181D);
   static const Color outline = Color(0xFF262A31);
   static const Color accent = Color(0xFF00E5A0);
+  /// Verde Spotify para barra de progreso y notificación.
+  static const Color spotify = Color(0xFF1DB954);
   static const Color accentDeep = Color(0xFF0B3D2E);
   static const Color amber = Color(0xFFFFB020);
   static const Color danger = Color(0xFFFF5C6C);

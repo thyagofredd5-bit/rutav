@@ -50,6 +50,15 @@ class AppConstants {
   static const Duration httpTimeout = Duration(seconds: 20);
   static const Duration llmTimeout = Duration(seconds: 60);
 
+  /// Modelo Gemini por defecto y cascada de respaldo (se usa si hay HTTP 404/400).
+  static const String defaultGeminiModel = 'gemini-3.0-flash';
+  static const List<String> geminiFallbackModels = [
+    'gemini-3.0-flash',
+    'gemini-3.8-flash',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash',
+  ];
+
   /// Wikimedia exige un User-Agent identificable con contacto. Cámbialo por el tuyo.
   static const String httpUserAgent =
       'RutaVivaAI/1.0 (Android; app de viaje; contacto: rutaviva-app@example.com)';

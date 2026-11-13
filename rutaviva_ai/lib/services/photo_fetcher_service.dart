@@ -17,10 +17,13 @@ class PlacesApiException implements Exception {
   String toString() => message;
 }
 
-/// Obtiene fotos reales sin API key (Wikipedia/Wikimedia) y, opcionalmente,
-/// restaurantes con fotos y calificación vía Google Places API (New).
+/// Fotos turísticas reales con filtrado estricto. Orden de prioridad:
+///  1. Google Places (lugares turísticos en lat/lng) — si hay API Key.
+///  2. Wikipedia geosearch (es + en) por coordenadas GPS.
+///  3. Wikimedia Commons con filtro anti-personas/mascotas/mapas.
+///  4. Respaldo por zona geográfica (según msnm), solo si no hubo nada válido.
 ///
-/// Los métodos de Wikimedia NUNCA lanzan excepciones: si falla la red devuelven
+/// Los métodos de fotos NUNCA lanzan excepciones: ante fallos de red devuelven
 /// listas vacías para que la UI muestre el resto del contenido.
 class PhotoFetcherService {
   PhotoFetcherService({http.Client? client}) : _client = client ?? http.Client();
@@ -33,194 +36,354 @@ class PhotoFetcherService {
     'Accept': 'application/json',
   };
 
-  /// Títulos que casi nunca son fotos del lugar (mapas, escudos, banderas…).
-  static final RegExp _junkTitle = RegExp(
-    r'(mapa|map\b|escudo|logo|bandera|flag|coat[_ ]of|locator|diagram|esquema|'
-    r'plano|ubicaci[oó]n|cartel|poster|afiche|\bsign\b|screenshot|captura)',
+  /// Palabras prohibidas en título, descripción, categorías o URL.
+  static final RegExp _banned = RegExp(
+    r'\b(dogs?|perros?|cats?|gatos?|pets?|boys?|girls?|child|children|niñ[oa]s?|'
+    r'persons?|people|portrait|selfie|maps?|mapa|locator|escudo|coat of arms|'
+    r'flags?|bandera|logo)\b',
     caseSensitive: false,
   );
+
+  static bool _isJunk(String? raw) {
+    if (raw == null || raw.isEmpty) return false;
+    var t = raw;
+    try {
+      t = Uri.decodeFull(raw);
+    } catch (_) {}
+    t = t.toLowerCase().replaceAll(RegExp(r'[_\-/+]'), ' ');
+    return t.contains('.svg') || t.contains('.pdf') || _banned.hasMatch(t);
+  }
+
+  static String _norm(String s) {
+    const from = 'áéíóúüñ';
+    const to = 'aeiouun';
+    var t = s.toLowerCase();
+    for (var i = 0; i < from.length; i++) {
+      t = t.replaceAll(from[i], to[i]);
+    }
+    return t.replaceAll('_', ' ');
+  }
+
+  /// URL de la página de escritorio (sin ternarios anidados: Dart 3).
+  static String? _desktopPageUrl(Map<String, dynamic> json) {
+    String? pageUrl;
+    if (json['content_urls'] is Map &&
+        (json['content_urls'] as Map)['desktop'] is Map) {
+      pageUrl =
+          ((json['content_urls'] as Map)['desktop'] as Map)['page']?.toString();
+    }
+    return pageUrl;
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   //  FOTOS DEL PUEBLO
   // ═══════════════════════════════════════════════════════════════════════
 
-  /// Combina tres fuentes en paralelo y devuelve hasta [maxPhotos] fotos únicas:
-  ///  1. Imagen principal del artículo (REST summary de es.wikipedia).
-  ///  2. Archivos de Commons georreferenciados (generator=geosearch, ggscoord).
-  ///  3. Imágenes de artículos cercanos de es.wikipedia.
-  Future<List<TownPhoto>> fetchTownPhotos(TownModel town,
-      {int maxPhotos = 8}) async {
-    final results = await Future.wait<List<TownPhoto>>([
-      _safe(() => _wikipediaSummaryPhotos(town)),
-      _safe(() => _commonsGeoPhotos(town)),
-      _safe(() => _wikipediaGeoPagePhotos(town)),
-    ]);
-
+  Future<List<TownPhoto>> fetchTownPhotos(
+    TownModel town, {
+    int maxPhotos = 8,
+    String placesApiKey = '',
+  }) async {
     final seen = <String>{};
-    final merged = <TownPhoto>[];
-    for (final list in results) {
+    final out = <TownPhoto>[];
+
+    void add(Iterable<TownPhoto> list) {
       for (final p in list) {
-        if (p.url.isEmpty || !seen.add(p.url)) continue;
-        merged.add(p);
-        if (merged.length >= maxPhotos) return merged;
+        if (out.length >= maxPhotos) return;
+        if (p.url.isEmpty) continue;
+        if (p.source != 'Google Places' && (_isJunk(p.url) || _isJunk(p.title))) {
+          continue;
+        }
+        if (seen.add(p.url)) out.add(p);
       }
     }
-    return merged;
+
+    final key = placesApiKey.trim();
+    // Prioridad 1: Google Places.
+    if (key.isNotEmpty) {
+      add(await _safeList(() => _placesTouristPhotos(town, key)));
+    }
+    // Prioridad 2: Wikipedia geosearch (es + en).
+    if (out.length < maxPhotos) {
+      final geo = await Future.wait<List<TownPhoto>>([
+        _safeList(() => _wikipediaGeoPhotos(town, 'es')),
+        _safeList(() => _wikipediaGeoPhotos(town, 'en')),
+      ]);
+      for (final l in geo) {
+        add(l);
+      }
+    }
+    // Prioridad 3: Commons filtrado.
+    if (out.length < 3) {
+      add(await _safeList(() => _commonsSearchPhotos(town)));
+    }
+    // Prioridad 4: respaldo por zona geográfica.
+    if (out.isEmpty) {
+      add(await _safeList(() => _regionFallbackPhotos(town)));
+    }
+    return out;
   }
 
-  Future<List<TownPhoto>> _wikipediaSummaryPhotos(TownModel town) async {
-    final title = (town.wikipedia ?? town.nombreLugar).replaceAll(' ', '_');
-    final uri = Uri.https('es.wikipedia.org', '/api/rest_v1/page/summary/$title');
-    final json = await _getJson(uri);
-    if (json == null || json['type'] == 'disambiguation') return const [];
+  // ── P1: Google Places ──────────────────────────────────────────────────
 
-    final original = json['originalimage'];
-    final thumb = json['thumbnail'];
-    String? url;
-    int? w;
-    int? h;
-    // Los originales pueden pesar decenas de MB: se prefiere la miniatura grande.
-    if (original is Map && ((original['width'] as num?) ?? 99999) <= 2000) {
-      url = original['source'] as String?;
-      w = (original['width'] as num?)?.toInt();
-      h = (original['height'] as num?)?.toInt();
-    } else if (thumb is Map) {
-      url = thumb['source'] as String?;
-      w = (thumb['width'] as num?)?.toInt();
-      h = (thumb['height'] as num?)?.toInt();
+  Future<List<TownPhoto>> _placesTouristPhotos(
+      TownModel town, String apiKey) async {
+    final res = await _client
+        .post(
+          Uri.https('places.googleapis.com', '/v1/places:searchNearby'),
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            'X-Goog-FieldMask':
+                'places.id,places.displayName,places.photos,places.googleMapsUri',
+          },
+          body: jsonEncode({
+            'includedTypes': ['tourist_attraction', 'park'],
+            'maxResultCount': 10,
+            'languageCode': 'es',
+            'rankPreference': 'POPULARITY',
+            'locationRestriction': {
+              'circle': {
+                'center': {'latitude': town.lat, 'longitude': town.lng},
+                'radius': 5000.0,
+              },
+            },
+          }),
+        )
+        .timeout(AppConstants.httpTimeout);
+    if (res.statusCode != 200) return const <TownPhoto>[];
+    final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+    if (decoded is! Map || decoded['places'] is! List) return const <TownPhoto>[];
+
+    final out = <TownPhoto>[];
+    for (final raw in decoded['places'] as List) {
+      if (raw is! Map) continue;
+      final name = ((raw['displayName'] as Map?)?['text'] as String?) ?? '';
+      final photos = raw['photos'];
+      if (photos is! List) continue;
+      var taken = 0;
+      for (final ph in photos) {
+        if (ph is! Map || taken >= 2) continue;
+        final pname = ph['name'] as String?;
+        final w = (ph['widthPx'] as num?)?.toInt();
+        final h = (ph['heightPx'] as num?)?.toInt();
+        if (pname == null) continue;
+        if (w != null && h != null && w < h) continue; // solo horizontales
+        String? author;
+        final attrs = ph['authorAttributions'];
+        if (attrs is List && attrs.isNotEmpty && attrs.first is Map) {
+          author = (attrs.first as Map)['displayName']?.toString();
+        }
+        out.add(TownPhoto(
+          url: placePhotoUrl(pname, apiKey, maxWidth: 1000),
+          thumbUrl: placePhotoUrl(pname, apiKey, maxWidth: 800),
+          title: name.isEmpty ? town.nombreLugar : name,
+          author: author,
+          source: 'Google Places',
+          pageUrl: raw['googleMapsUri'] as String?,
+          width: w,
+          height: h,
+        ));
+        taken++;
+      }
     }
-    if (url == null || url.toLowerCase().endsWith('.svg')) return const [];
-
-    String? pageUrl;
-    if (json['content_urls'] is Map && (json['content_urls'] as Map)['desktop'] is Map) {
-      pageUrl = ((json['content_urls'] as Map)['desktop'] as Map)['page']?.toString();
-    }
-
-    return [
-      TownPhoto(
-        url: url,
-        thumbUrl: thumb is Map ? thumb['source'] as String? : null,
-        title: (json['title'] as String?) ?? town.nombreLugar,
-        license: 'Wikipedia',
-        source: 'Wikimedia Commons',
-        pageUrl: pageUrl,
-        width: w,
-        height: h,
-      ),
-    ];
+    return out;
   }
 
-  Future<List<TownPhoto>> _commonsGeoPhotos(TownModel town) async {
-    final uri = Uri.https('commons.wikimedia.org', '/w/api.php', {
+  // ── P2: Wikipedia geosearch ────────────────────────────────────────────
+
+  Future<List<TownPhoto>> _wikipediaGeoPhotos(TownModel town, String lang) async {
+    final uri = Uri.https('$lang.wikipedia.org', '/w/api.php', {
       'action': 'query',
       'format': 'json',
       'formatversion': '2',
       'generator': 'geosearch',
       'ggscoord': '${town.lat}|${town.lng}',
-      'ggsradius': '10000',
-      'ggslimit': '40',
-      'ggsnamespace': '6',
-      'prop': 'imageinfo',
-      'iiprop': 'url|size|mime|extmetadata',
-      'iiurlwidth': '960',
-      'iiextmetadatafilter': 'Artist|LicenseShortName',
-    });
-    return _photosFromImageInfoPages(await _getJson(uri), minWidth: 1000);
-  }
-
-  Future<List<TownPhoto>> _wikipediaGeoPagePhotos(TownModel town) async {
-    final uri = Uri.https('es.wikipedia.org', '/w/api.php', {
-      'action': 'query',
-      'format': 'json',
-      'formatversion': '2',
-      'generator': 'geosearch',
-      'ggscoord': '${town.lat}|${town.lng}',
-      'ggsradius': '10000',
-      'ggslimit': '12',
+      'ggsradius': '5000',
+      'ggslimit': '20',
       'prop': 'pageimages',
       'piprop': 'thumbnail',
-      'pithumbsize': '960',
-      'pilimit': '12',
+      'pithumbsize': '1000',
+      'pilimit': '20',
     });
     final json = await _getJson(uri);
-    final pages = _pagesOf(json);
     final out = <TownPhoto>[];
-    for (final page in pages) {
+    for (final page in _pagesOf(json)) {
       final thumb = page['thumbnail'];
       if (thumb is! Map) continue;
       final url = thumb['source'] as String?;
       final title = page['title'] as String? ?? '';
-      if (url == null || url.toLowerCase().contains('.svg') || _junkTitle.hasMatch(title)) {
-        continue;
-      }
+      final w = (thumb['width'] as num?)?.toInt();
+      final h = (thumb['height'] as num?)?.toInt();
+      if (url == null || _isJunk(url) || _isJunk(title)) continue;
+      if (w != null && w < 500) continue;
       out.add(TownPhoto(
         url: url,
         thumbUrl: url,
         title: title,
         license: 'Wikipedia',
-        source: 'Wikipedia',
-        pageUrl: 'https://es.wikipedia.org/wiki/${Uri.encodeComponent(title.replaceAll(' ', '_'))}',
-        width: (thumb['width'] as num?)?.toInt(),
-        height: (thumb['height'] as num?)?.toInt(),
+        source: 'Wikipedia ($lang)',
+        pageUrl:
+            'https://$lang.wikipedia.org/wiki/${Uri.encodeComponent(title.replaceAll(' ', '_'))}',
+        width: w,
+        height: h,
       ));
     }
     return out;
+  }
+
+  // ── P3: Commons filtrado ───────────────────────────────────────────────
+
+  Future<List<TownPhoto>> _commonsSearchPhotos(TownModel town) async {
+    final uri = Uri.https('commons.wikimedia.org', '/w/api.php', {
+      'action': 'query',
+      'format': 'json',
+      'formatversion': '2',
+      'generator': 'search',
+      'gsrnamespace': '6',
+      'gsrsearch':
+          '"${town.nombreLugar}" ${town.provincia} Peru (paisaje OR plaza OR mirador OR iglesia) filetype:bitmap',
+      'gsrlimit': '30',
+      'prop': 'imageinfo|categories',
+      'cllimit': 'max',
+      'iiprop': 'url|size|mime|extmetadata',
+      'iiurlwidth': '1000',
+      'iiextmetadatafilter': 'Artist|LicenseShortName|ImageDescription|Categories',
+    });
+    return _photosFromImageInfoPages(
+      await _getJson(uri),
+      minWidth: 900,
+      landscapeOnly: true,
+      mustMention: town.nombreLugar,
+    );
+  }
+
+  // ── P4: respaldo por zona (según altitud) ─────────────────────────────
+
+  static List<String> _regionTitles(int msnm) {
+    if (msnm < 500) {
+      return const [
+        'Reserva Nacional de Paracas',
+        'Islas Ballestas',
+        'Lomas de Lachay',
+        'Reserva Nacional San Fernando',
+      ];
+    }
+    if (msnm < 1800) {
+      return const [
+        'Huacachina',
+        'Líneas de Nazca',
+        'Valle de Majes',
+        'Desierto de Ica',
+      ];
+    }
+    if (msnm < 2800) {
+      return const [
+        'Misti',
+        'Chachani',
+        'Arequipa',
+        'Centro histórico de Arequipa',
+      ];
+    }
+    return const [
+      'Cañón del Colca',
+      'Ampato',
+      'Coropuna',
+      'Reserva Nacional de Salinas y Aguada Blanca',
+    ];
+  }
+
+  /// Fotos reales de artículos emblemáticos de la zona (resueltas en línea
+  /// desde Wikipedia para no depender de URLs fijas que podrían romperse).
+  Future<List<TownPhoto>> _regionFallbackPhotos(TownModel town) async {
+    final titles = _regionTitles(town.msnm);
+    final results = await Future.wait<TownPhoto?>([
+      for (final t in titles) _summaryPhoto(t),
+    ]);
+    return [
+      for (final p in results)
+        if (p != null) p,
+    ];
+  }
+
+  Future<TownPhoto?> _summaryPhoto(String title, {String lang = 'es'}) async {
+    try {
+      final json = await _getJson(Uri.https('$lang.wikipedia.org',
+          '/api/rest_v1/page/summary/${title.replaceAll(' ', '_')}'));
+      if (json == null || json['type'] != 'standard') return null;
+      final original = json['originalimage'];
+      final thumb = json['thumbnail'];
+      String? url;
+      int? w;
+      int? h;
+      if (original is Map && ((original['width'] as num?) ?? 99999) <= 2000) {
+        url = original['source'] as String?;
+        w = (original['width'] as num?)?.toInt();
+        h = (original['height'] as num?)?.toInt();
+      } else if (thumb is Map) {
+        url = thumb['source'] as String?;
+        w = (thumb['width'] as num?)?.toInt();
+        h = (thumb['height'] as num?)?.toInt();
+      }
+      if (url == null || _isJunk(url)) return null;
+
+      String? pageUrl;
+      if (json['content_urls'] is Map &&
+          (json['content_urls'] as Map)['desktop'] is Map) {
+        pageUrl =
+            ((json['content_urls'] as Map)['desktop'] as Map)['page']?.toString();
+      }
+      return TownPhoto(
+        url: url,
+        thumbUrl: thumb is Map ? thumb['source'] as String? : null,
+        title: (json['title'] as String?) ?? title,
+        license: 'Wikipedia',
+        source: 'Wikipedia',
+        pageUrl: pageUrl,
+        width: w,
+        height: h,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
   //  FOTO DE UN PLATO TÍPICO
   // ═══════════════════════════════════════════════════════════════════════
 
-  /// Intenta Wikipedia (título del plato) y luego una búsqueda en Commons.
-  /// Puede devolver una imagen aproximada: la UI debe mostrar la atribución.
   Future<TownPhoto?> fetchDishPhoto(String plato) async {
     final name = plato.trim();
     if (name.isEmpty) return null;
 
-    final fromWiki = await _safe<TownPhoto?>(() async {
-      final title = name.replaceAll(' ', '_');
-      final json = await _getJson(
-          Uri.https('es.wikipedia.org', '/api/rest_v1/page/summary/$title'));
-      if (json == null || json['type'] != 'standard') return null;
-      final thumb = json['thumbnail'];
-      final url = thumb is Map ? thumb['source'] as String? : null;
-      if (url == null || url.toLowerCase().endsWith('.svg')) return null;
-      return TownPhoto(
-        url: url,
-        thumbUrl: url,
-        title: (json['title'] as String?) ?? name,
-        license: 'Wikipedia',
-        source: 'Wikimedia Commons',
-        pageUrl: ((json['content_urls'] as Map?)?['desktop'] as Map?)?['page']
-            as String?,
-        width: (thumb['width'] as num?)?.toInt(),
-        height: (thumb['height'] as num?)?.toInt(),
-      );
-    }, fallback: null);
-    if (fromWiki != null) return fromWiki;
+    final fromWiki = await _summaryPhoto(name);
+    if (fromWiki != null && !_isJunk(fromWiki.title)) return fromWiki;
 
-    return _safe<TownPhoto?>(() async {
+    try {
       final uri = Uri.https('commons.wikimedia.org', '/w/api.php', {
         'action': 'query',
         'format': 'json',
         'formatversion': '2',
         'generator': 'search',
         'gsrnamespace': '6',
-        'gsrsearch': '$name filetype:bitmap',
-        'gsrlimit': '6',
-        'prop': 'imageinfo',
+        'gsrsearch': '$name comida filetype:bitmap',
+        'gsrlimit': '8',
+        'prop': 'imageinfo|categories',
+        'cllimit': 'max',
         'iiprop': 'url|size|mime|extmetadata',
         'iiurlwidth': '640',
-        'iiextmetadatafilter': 'Artist|LicenseShortName',
+        'iiextmetadatafilter': 'Artist|LicenseShortName|ImageDescription|Categories',
       });
-      final photos =
-          _photosFromImageInfoPages(await _getJson(uri), minWidth: 500);
+      final photos = _photosFromImageInfoPages(await _getJson(uri),
+          minWidth: 500, mustMention: name.split(' ').first);
       return photos.isEmpty ? null : photos.first;
-    }, fallback: null);
+    } catch (_) {
+      return null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  //  GOOGLE PLACES API (NEW) — opcional
+  //  GOOGLE PLACES API (NEW) — restaurantes (opcional)
   // ═══════════════════════════════════════════════════════════════════════
 
   static const String _placesFieldMask = 'places.id,places.displayName,'
@@ -228,7 +391,6 @@ class PhotoFetcherService {
       'places.location,places.photos,places.currentOpeningHours.openNow,'
       'places.primaryTypeDisplayName,places.googleMapsUri';
 
-  /// `places:searchNearby` y, si no hay resultados, `places:searchText`.
   Future<List<RoadsidePlace>> fetchRestaurants(
     TownModel town,
     String apiKey, {
@@ -284,15 +446,14 @@ class PhotoFetcherService {
     return _placesRequest('places:searchText', apiKey, body, town);
   }
 
-  /// Prueba rápida de la clave (botón "Probar conexión" de Ajustes).
   Future<void> testPlacesKey(String apiKey) async {
     final body = {
       'textQuery': 'restaurante Lima Perú',
       'maxResultCount': 1,
       'languageCode': 'es',
     };
-    await _placesRequest(
-        'places:searchText', apiKey, body, null, fieldMask: 'places.id');
+    await _placesRequest('places:searchText', apiKey, body, null,
+        fieldMask: 'places.id');
   }
 
   Future<List<RoadsidePlace>> _placesRequest(
@@ -347,8 +508,7 @@ class PhotoFetcherService {
           direccion: p['formattedAddress'] as String?,
           rating: (p['rating'] as num?)?.toDouble(),
           ratingCount: (p['userRatingCount'] as num?)?.toInt(),
-          abiertoAhora:
-              (p['currentOpeningHours'] as Map?)?['openNow'] as bool?,
+          abiertoAhora: (p['currentOpeningHours'] as Map?)?['openNow'] as bool?,
           photoUrl: photoUrl,
           lat: lat,
           lng: lng,
@@ -383,19 +543,20 @@ class PhotoFetcherService {
   //  UTILIDADES
   // ═══════════════════════════════════════════════════════════════════════
 
-  Future<T> _safe<T>(Future<T> Function() action, {T? fallback}) async {
+  Future<List<TownPhoto>> _safeList(
+      Future<List<TownPhoto>> Function() action) async {
     try {
       return await action();
     } catch (_) {
-      if (fallback is T) return fallback;
-      return <TownPhoto>[] as T;
+      return const <TownPhoto>[];
     }
   }
 
   Future<Map<String, dynamic>?> _getJson(Uri uri) async {
     try {
-      final res =
-          await _client.get(uri, headers: _wikiHeaders).timeout(AppConstants.httpTimeout);
+      final res = await _client
+          .get(uri, headers: _wikiHeaders)
+          .timeout(AppConstants.httpTimeout);
       if (res.statusCode != 200) return null;
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       return decoded is Map<String, dynamic> ? decoded : null;
@@ -413,14 +574,19 @@ class PhotoFetcherService {
   List<Map<String, dynamic>> _pagesOf(Map<String, dynamic>? json) {
     final pages = (json?['query'] as Map?)?['pages'];
     if (pages is! List) return const [];
-    final list = pages.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
+    final list =
+        pages.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
     list.sort((a, b) =>
         ((a['index'] as num?) ?? 9999).compareTo((b['index'] as num?) ?? 9999));
     return list;
   }
 
-  List<TownPhoto> _photosFromImageInfoPages(Map<String, dynamic>? json,
-      {required int minWidth}) {
+  List<TownPhoto> _photosFromImageInfoPages(
+    Map<String, dynamic>? json, {
+    required int minWidth,
+    bool landscapeOnly = false,
+    String? mustMention,
+  }) {
     final out = <TownPhoto>[];
     for (final page in _pagesOf(json)) {
       final infos = page['imageinfo'];
@@ -432,22 +598,44 @@ class PhotoFetcherService {
       final width = (info['width'] as num?)?.toInt() ?? 0;
       final height = (info['height'] as num?)?.toInt() ?? 0;
       if (width < minWidth || height < 400) continue;
+      if (landscapeOnly && width < height * 1.1) continue;
 
       final rawTitle = (page['title'] as String? ?? '').replaceFirst('File:', '');
-      if (_junkTitle.hasMatch(rawTitle)) continue;
+      final meta = info['extmetadata'];
+      String? field(String k) {
+        if (meta is Map && meta[k] is Map) {
+          return _stripHtml((meta[k] as Map)['value']);
+        }
+        return null;
+      }
+
+      final desc = field('ImageDescription') ?? '';
+      final cats = field('Categories') ?? '';
+      final catTitles = page['categories'] is List
+          ? (page['categories'] as List)
+              .whereType<Map>()
+              .map((c) => (c['title'] ?? '').toString())
+              .join(' ')
+          : '';
+      final haystack = '$rawTitle $desc $cats $catTitles';
+      if (_isJunk(haystack)) continue;
+      if (mustMention != null &&
+          !_norm(haystack).contains(_norm(mustMention))) {
+        continue;
+      }
 
       final url = (info['thumburl'] ?? info['url']) as String?;
-      if (url == null) continue;
+      if (url == null || _isJunk(url)) continue;
 
-      final meta = info['extmetadata'];
-      final author = meta is Map ? _stripHtml(meta['Artist']?['value']) : null;
-      final license =
-          meta is Map ? _stripHtml(meta['LicenseShortName']?['value']) : null;
+      final author = field('Artist');
+      final license = field('LicenseShortName');
 
       out.add(TownPhoto(
         url: url,
         thumbUrl: url,
-        title: rawTitle.replaceAll(RegExp(r'\.[A-Za-z]{3,4}$'), '').replaceAll('_', ' '),
+        title: rawTitle
+            .replaceAll(RegExp(r'\.[A-Za-z]{3,4}$'), '')
+            .replaceAll('_', ' '),
         author: (author == null || author.isEmpty) ? null : author,
         license: (license == null || license.isEmpty) ? null : license,
         source: 'Wikimedia Commons',

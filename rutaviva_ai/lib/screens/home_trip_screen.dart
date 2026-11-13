@@ -151,7 +151,7 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
     );
   }
 
-  // ── Tarjeta estilo Spotify ─────────────────────────────────────────────
+  // ── Tarjeta "Now Playing" con foto real del pueblo ──────────────────────
 
   Widget _nowPlaying(TripController c) {
     final snap = c.snapshot;
@@ -160,164 +160,76 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
     final next = c.nextTown;
     final total = (c.destinationTown.kmRuta - c.originTown.kmRuta).abs();
 
+    // Descarga (y cachea) la foto panorámica del pueblo actual.
+    WidgetsBinding.instance.addPostFrameCallback((_) => c.ensureHero(town));
+
     final String status;
     if (p == null) {
       status = c.running ? 'Obteniendo ubicación…' : 'Sin lectura todavía';
     } else if (p.arrived) {
-      status = '🏁 Llegaste a tu destino';
+      status = 'Llegaste a tu destino';
     } else if (p.atTown) {
-      status = 'Estás en el pueblo';
+      status = '${town.provincia} · estás en el pueblo';
     } else {
       status = 'Último pueblo · a ${formatKm(p.distanceToCurrentTownKm)} km';
     }
 
     final double? nextDist = p != null
         ? p.nextTownDistanceKm
-        : (next != null
-            ? (next.kmRuta - c.originTown.kmRuta).abs()
-            : null);
+        : (next != null ? (next.kmRuta - c.originTown.kmRuta).abs() : null);
     final remaining = p?.kmRemaining ?? total;
 
-    final hh = snap?.readAt.hour.toString().padLeft(2, '0');
-    final mm = snap?.readAt.minute.toString().padLeft(2, '0');
+    final warnings = <String>[
+      if (p != null && p.isOffRoute)
+        'Estás a ${formatKm(p.offRouteKm)} km de la carretera principal.',
+      if (snap != null && snap.isStale)
+        'Posición aproximada: se usó la última ubicación conocida.',
+    ];
 
-    return RvCard(
-      padding: const EdgeInsets.all(20),
-      gradient: const LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [AppColors.accentDeep, AppColors.surface],
-      ),
-      borderColor: AppColors.alpha(AppColors.accent, 0.25),
+    String footer = 'Inicia el seguimiento para ver tu avance en vivo.';
+    if (snap != null) {
+      final hh = snap.readAt.hour.toString().padLeft(2, '0');
+      final mm = snap.readAt.minute.toString().padLeft(2, '0');
+      final acc = snap.accuracyMeters != null
+          ? ' · ±${snap.accuracyMeters!.round()} m'
+          : '';
+      footer = 'Lectura $hh:$mm · ${snap.reason.label}$acc';
+    }
+
+    return RvNowPlayingCard(
+      imageUrl: c.heroFor(town)?.url,
+      running: c.running,
+      pillText: '${c.running ? 'EN RUTA' : 'LISTO'} • '
+          '${formatThousands(town.msnm)} msnm • Km ${town.kmRuta.round()}',
+      townName: town.nombre,
+      subtitle: '${town.provincia} · ${town.departamento}',
+      statusText: status,
+      nextLabel: next?.nombre ?? 'Destino',
+      nextDetail: nextDist != null
+          ? 'Faltan ${formatKm(nextDist)} km'
+          : 'a la vista',
+      destinationDetail:
+          'Faltan ${formatKm(remaining)} km hasta ${c.destinationTown.nombreLugar}',
+      progress: p?.progress ?? 0,
+      leftLabel: '${p?.percent ?? 0}% · ${formatKm(p?.kmTraveled ?? 0)} km',
+      rightLabel: '${formatKm(p?.kmTotal ?? total)} km',
+      footer: footer,
+      warnings: warnings,
       onTap: () => TownExplorerSheet.show(context, town),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(c.running ? Icons.graphic_eq : Icons.directions_bus_outlined,
-                  size: 18, color: AppColors.accent),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  c.running ? 'EN RUTA · ${c.routeLabel}' : c.routeLabel,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      color: AppColors.accent,
-                      fontSize: 12,
-                      letterSpacing: 1,
-                      fontWeight: FontWeight.w700),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Text(town.nombre,
-              style: const TextStyle(
-                  fontSize: 30, fontWeight: FontWeight.w800, height: 1.1)),
-          const SizedBox(height: 4),
-          Text('${town.provincia} · ${town.departamento}',
-              style: const TextStyle(color: AppColors.textMuted, fontSize: 15)),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              RvChip.altitude(town.msnm),
-              RvChip.km(town.kmRuta),
-              RvChip(
-                  label: status,
-                  icon: Icons.near_me,
-                  color: AppColors.textMuted),
-            ],
-          ),
-          const SizedBox(height: 20),
-          RvProgressBar(
-            progress: p?.progress ?? 0,
-            leftLabel: '${p?.percent ?? 0}% · ${formatKm(p?.kmTraveled ?? 0)} km',
-            rightLabel: '${formatKm(p?.kmTotal ?? total)} km',
-          ),
-          const SizedBox(height: 16),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: _stat(
-                  'PRÓXIMO PUEBLO',
-                  next?.nombre ?? 'Destino',
-                  nextDist != null ? 'a ${formatKm(nextDist)} km' : null,
-                ),
-              ),
-              const SizedBox(width: 12),
-              _stat('FALTAN', '${formatKm(remaining)} km', null,
-                  alignEnd: true),
-            ],
-          ),
-          const SizedBox(height: 14),
-          if (p != null && p.isOffRoute)
-            _note(Icons.alt_route,
-                'Estás a ${formatKm(p.offRouteKm)} km de la carretera principal.'),
-          if (snap != null && snap.isStale)
-            _note(Icons.gps_not_fixed,
-                'Posición aproximada: se usó la última ubicación conocida.'),
-          Text(
-            snap != null
-                ? 'Lectura $hh:$mm · ${snap.reason.label}'
-                    '${snap.accuracyMeters != null ? ' · ±${snap.accuracyMeters!.round()} m' : ''}'
-                : 'Inicia el seguimiento para ver tu avance en vivo.',
-            style: const TextStyle(color: AppColors.textMuted, fontSize: 12),
-          ),
-          const SizedBox(height: 6),
-          const Row(
-            children: [
-              Icon(Icons.touch_app, size: 14, color: AppColors.textMuted),
-              SizedBox(width: 6),
-              Text('Toca para explorar este pueblo',
-                  style: TextStyle(color: AppColors.textMuted, fontSize: 12)),
-            ],
-          ),
-        ],
-      ),
     );
   }
 
-  Widget _stat(String label, String value, String? sub,
-      {bool alignEnd = false}) {
-    return Column(
-      crossAxisAlignment:
-          alignEnd ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-      children: [
-        Text(label,
-            style: const TextStyle(
-                color: AppColors.textMuted,
-                fontSize: 10,
-                letterSpacing: 1.1,
-                fontWeight: FontWeight.w700)),
-        const SizedBox(height: 4),
-        Text(value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-        if (sub != null)
-          Text(sub,
-              style: const TextStyle(color: AppColors.accent, fontSize: 13)),
-      ],
-    );
-  }
-
-  Widget _note(IconData icon, String text) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
+  Widget _dirLabel(String a, String b) {
+    return FittedBox(
+      fit: BoxFit.scaleDown,
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 16, color: AppColors.amber),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(text,
-                style: const TextStyle(color: AppColors.amber, fontSize: 12)),
-          ),
+          Text(a),
+          const SizedBox(width: 6),
+          const Icon(Icons.arrow_forward_rounded, size: 16),
+          const SizedBox(width: 6),
+          Text(b),
         ],
       ),
     );
@@ -336,15 +248,11 @@ class _HomeTripScreenState extends ConsumerState<HomeTripScreen> {
             width: double.infinity,
             child: SegmentedButton<bool>(
               showSelectedIcon: false,
-              segments: const [
+              segments: [
                 ButtonSegment<bool>(
-                    value: true,
-                    label: Text('Lima ➔ Arequipa',
-                        maxLines: 1, softWrap: false)),
+                    value: true, label: _dirLabel('Lima', 'Arequipa')),
                 ButtonSegment<bool>(
-                    value: false,
-                    label: Text('Arequipa ➔ Lima',
-                        maxLines: 1, softWrap: false)),
+                    value: false, label: _dirLabel('Arequipa', 'Lima')),
               ],
               selected: {c.isForward},
               style: SegmentedButton.styleFrom(

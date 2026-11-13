@@ -13,9 +13,11 @@ import 'photo_fetcher_service.dart';
 
 /// Error legible para mostrar en la UI.
 class AiExplorerException implements Exception {
-  const AiExplorerException(this.kind, this.message);
+  const AiExplorerException(this.kind, this.message, {this.statusCode});
   final AiErrorKind kind;
   final String message;
+  /// Código HTTP si el error vino del servidor (para la cascada de modelos).
+  final int? statusCode;
   @override
   String toString() => message;
 }
@@ -94,6 +96,11 @@ class AiExplorerService {
       .where((k) => k.startsWith(AppConstants.prefsGuideCachePrefix))
       .length;
 
+  /// Fotos turísticas filtradas (Places → Wikipedia geosearch → Commons → zona).
+  Future<List<TownPhoto>> fetchPhotos(TownModel town,
+          {String placesApiKey = ''}) =>
+      _photos.fetchTownPhotos(town, placesApiKey: placesApiKey);
+
   /// Botón "Probar conexión" de Ajustes.
   Future<LlmTestResult> testLlmConnection(AppSettings settings) async {
     if (!settings.hasLlmKey) {
@@ -115,7 +122,7 @@ class AiExplorerService {
       return LlmTestResult(
         ok: ok,
         message: ok
-            ? 'Conexión correcta con ${settings.provider.label} (${settings.effectiveModel}).'
+            ? 'Conexión correcta con ${settings.provider.label} (${out.model ?? settings.effectiveModel}).'
             : 'El modelo respondió, pero con un formato inesperado.',
         latencyMs: sw.elapsedMilliseconds,
       );
@@ -167,7 +174,8 @@ class AiExplorerService {
 
     Future<void> loadPhotos() async {
       emit(state.copyWith(loadingPhotos: true));
-      final photos = await _photos.fetchTownPhotos(town);
+      final photos = await _photos.fetchTownPhotos(town,
+          placesApiKey: settings.placesApiKey);
       if (photos.isNotEmpty) dirty = true;
       emit(state.copyWith(photos: photos, loadingPhotos: false));
     }
@@ -288,7 +296,7 @@ class AiExplorerService {
           _extractJson(out.text),
           fallbackName: town.nombreLugar,
           provider: settings.provider.label,
-          model: settings.effectiveModel,
+          model: out.model ?? settings.effectiveModel,
           fuentes: out.sources,
           grounded: out.grounded,
         );
@@ -440,21 +448,54 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
     }
   }
 
+  /// Llama a Gemini con cascada automática:
+  ///  · Modelos: el configurado y luego gemini-3.0-flash, gemini-3.8-flash,
+  ///    gemini-2.5-pro, gemini-2.0-flash (si hay HTTP 404 se pasa al siguiente).
+  ///  · Variantes por modelo (si hay HTTP 400): con google_search → sin tools con
+  ///    esquema JSON → solo prompt. Así la guía SIEMPRE intenta generarse.
   Future<_LlmOutput> _callGemini(AppSettings s, String system, String user,
       Map<String, dynamic>? schema, int maxTokens,
       {required bool grounding}) async {
-    final model = s.effectiveModel;
-    final uri = Uri.https(
-        'generativelanguage.googleapis.com', '/v1beta/models/$model:generateContent');
+    final models = <String>[];
+    for (final m in [s.effectiveModel, ...AppConstants.geminiFallbackModels]) {
+      if (m.isNotEmpty && !models.contains(m)) models.add(m);
+    }
+    // (usa google_search, usa responseSchema)
+    final variants = grounding
+        ? const <(bool, bool)>[(true, false), (false, true), (false, false)]
+        : const <(bool, bool)>[(false, true), (false, false)];
+
+    AiExplorerException? last;
+    for (final model in models) {
+      for (final v in variants) {
+        try {
+          return await _callGeminiOnce(s, model, system, user, schema, maxTokens,
+              tools: v.$1, useSchema: v.$2);
+        } on AiExplorerException catch (e) {
+          last = e;
+          if (e.statusCode == 404) break; // modelo no disponible → siguiente
+          if (e.statusCode == 400 && e.kind != AiErrorKind.auth) continue;
+          rethrow; // clave, red, cuota, servidor…
+        }
+      }
+    }
+    throw last ??
+        const AiExplorerException(
+            AiErrorKind.unknown, 'No hay modelos de Gemini disponibles.');
+  }
+
+  Future<_LlmOutput> _callGeminiOnce(AppSettings s, String model, String system,
+      String user, Map<String, dynamic>? schema, int maxTokens,
+      {required bool tools, required bool useSchema}) async {
+    final uri = Uri.https('generativelanguage.googleapis.com',
+        '/v1beta/models/$model:generateContent');
 
     final generationConfig = <String, dynamic>{
-      'temperature': grounding ? 0.3 : 0.4,
+      'temperature': tools ? 0.3 : 0.4,
       'maxOutputTokens': maxTokens,
-      // Con google_search Gemini 2.5 NO admite responseMimeType/responseSchema:
-      // el JSON se exige por prompt y se extrae de forma tolerante.
-      if (!grounding) 'responseMimeType': 'application/json',
-      if (!grounding && schema != null) 'responseSchema': schema,
-      // Gemini 2.5 Flash: sin "thinking" para que los tokens vayan a la ficha.
+      // Con google_search no se admite responseMimeType/responseSchema.
+      if (!tools && useSchema) 'responseMimeType': 'application/json',
+      if (!tools && useSchema && schema != null) 'responseSchema': schema,
       if (model.contains('2.5') && model.contains('flash'))
         'thinkingConfig': {'thinkingBudget': 0},
     };
@@ -477,8 +518,7 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
           }
         ],
         'generationConfig': generationConfig,
-        // Grounding: Gemini busca en Google en tiempo real y devuelve las fuentes.
-        if (grounding)
+        if (tools)
           'tools': [
             {'google_search': {}}
           ],
@@ -515,8 +555,9 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
     }
     return _LlmOutput(
       text: text,
-      sources: grounding ? _groundingSources(cand) : const [],
-      grounded: grounding,
+      sources: tools ? _groundingSources(cand) : const [],
+      grounded: tools,
+      model: model,
     );
   }
 
@@ -647,6 +688,11 @@ MODO BÚSQUEDA WEB ACTIVADO (tiene prioridad sobre las reglas 2 y 5 en lo refere
   }
 
   AiExplorerException _httpError(http.Response r) {
+    final base = _httpErrorBase(r);
+    return AiExplorerException(base.kind, base.message, statusCode: r.statusCode);
+  }
+
+  AiExplorerException _httpErrorBase(http.Response r) {
     var detail = '';
     try {
       final j = jsonDecode(utf8.decode(r.bodyBytes));
@@ -705,8 +751,10 @@ class _LlmOutput {
     required this.text,
     this.sources = const [],
     this.grounded = false,
+    this.model,
   });
   final String text;
   final List<GuideSource> sources;
   final bool grounded;
+  final String? model;
 }

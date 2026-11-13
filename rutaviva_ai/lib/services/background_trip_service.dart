@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -11,11 +12,16 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart'
     hide NotificationVisibility;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/app_constants.dart';
+import '../models/app_settings.dart';
+import '../models/town_model.dart';
 import '../models/trip_models.dart';
 import 'offline_geocoder_service.dart';
 import 'permission_service.dart';
+import 'photo_fetcher_service.dart';
 
 // ═════════════════════════════════════════════════════════════════════════
 //  ARQUITECTURA
@@ -304,6 +310,13 @@ class TripTaskHandler extends TaskHandler {
   DateTime? _lastReadAt;
   TripSnapshot? _lastSnapshot;
 
+  // Foto del pueblo actual para la notificación (se descarga una sola vez).
+  final http.Client _http = http.Client();
+  final Map<String, Uint8List> _heroBytes = {};
+  final Map<String, DateTime> _heroFailedAt = {};
+  final Set<String> _heroLoading = {};
+  PhotoFetcherService? _photoFetcher;
+
   // ── Ciclo de vida ──────────────────────────────────────────────────────
 
   @override
@@ -340,6 +353,7 @@ class TripTaskHandler extends TaskHandler {
     IsolateNameServer.removePortNameMapping(AppConstants.taskPortName);
     _commandPort?.close();
     _commandPort = null;
+    _http.close();
     try {
       await _notifications.cancel(AppConstants.serviceId);
     } catch (_) {}
@@ -541,27 +555,108 @@ class TripTaskHandler extends TaskHandler {
     return km >= 10 ? km.round().toString() : km.toStringAsFixed(1);
   }
 
+  String _thousands(int n) {
+    final s = n.abs().toString();
+    final b = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) b.write(',');
+      b.write(s[i]);
+    }
+    return n < 0 ? '-${b.toString()}' : b.toString();
+  }
+
+  Future<Uint8List?> _download(String url) async {
+    try {
+      final res = await _http
+          .get(Uri.parse(url),
+              headers: {'User-Agent': AppConstants.httpUserAgent})
+          .timeout(const Duration(seconds: 12));
+      if (res.statusCode != 200) return null;
+      final bytes = res.bodyBytes;
+      if (bytes.isEmpty || bytes.length > 700 * 1024) return null;
+      return bytes;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Descarga la foto del pueblo y refresca la notificación con ella.
+  Future<void> _loadHeroAndRefresh(TownModel town) async {
+    if (_heroBytes.containsKey(town.id) || _heroLoading.contains(town.id)) return;
+    final failed = _heroFailedAt[town.id];
+    if (failed != null &&
+        DateTime.now().difference(failed) < const Duration(minutes: 10)) {
+      return;
+    }
+    _heroLoading.add(town.id);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+      final placesKey = SettingsRepository(prefs).load().placesApiKey;
+      final fetcher = _photoFetcher ??= PhotoFetcherService(client: _http);
+      final photos = await fetcher.fetchTownPhotos(town,
+          maxPhotos: 4, placesApiKey: placesKey);
+      Uint8List? bytes;
+      for (final p in photos) {
+        bytes = await _download(p.thumbUrl ?? p.url);
+        if (bytes != null) break;
+      }
+      if (bytes == null) {
+        _heroFailedAt[town.id] = DateTime.now();
+        return;
+      }
+      _heroBytes[town.id] = bytes;
+      final last = _lastSnapshot;
+      if (last != null && last.progress.currentTownId == town.id) {
+        await _showProgressNotification(last);
+      }
+    } catch (_) {
+      _heroFailedAt[town.id] = DateTime.now();
+    } finally {
+      _heroLoading.remove(town.id);
+    }
+  }
+
   Future<void> _showProgressNotification(TripSnapshot s,
       {String? warning}) async {
     final p = s.progress;
-    final title = '📍 Pasando por: ${p.currentTownName}, ${p.currentDepartment}';
+    final town = _geocoder?.byId(p.currentTownId);
+    final kmTown = (town?.kmRuta ?? p.routeKm).round();
+
+    final title = '📍 ${p.currentTownName} (Km $kmTown)';
     final next = p.nextTownName != null
-        ? ' • Próx: ${p.nextTownName} (${_fmtKm(p.nextTownDistanceKm)} km)'
-        : ' • Destino a la vista';
-    final base =
-        'Ruta ${p.originName} ➔ ${p.destinationName} • ${p.percent}% completado$next';
-    final body = warning != null ? '⚠ $warning\n$base' : base;
+        ? 'Próximo: ${p.nextTownName} a ${_fmtKm(p.nextTownDistanceKm)} km'
+        : 'Destino a la vista';
+    final subtitle =
+        town != null ? '$next • ${_thousands(town.msnm)} msnm' : next;
+    final body = warning != null ? '⚠ $warning\n$subtitle' : subtitle;
 
     final hh = s.readAt.hour.toString().padLeft(2, '0');
     final mm = s.readAt.minute.toString().padLeft(2, '0');
     final summary =
-        'Lectura $hh:$mm · ${s.reason.label}${s.isStale ? ' · última posición conocida' : ''}';
+        '${p.originName} a ${p.destinationName} • ${p.percent}% • $hh:$mm${s.isStale ? ' • última posición' : ''}';
+
+    // Progreso nativo en km (máximo = distancia total del viaje).
+    final maxKm = p.kmTotal.round() < 1 ? 1 : p.kmTotal.round();
+    final doneKm = p.kmTraveled.round().clamp(0, maxKm);
+
+    final bytes = town != null ? _heroBytes[town.id] : null;
+    final StyleInformation style = bytes != null
+        ? BigPictureStyleInformation(
+            ByteArrayAndroidBitmap(bytes),
+            largeIcon: ByteArrayAndroidBitmap(bytes),
+            contentTitle: title,
+            summaryText: body,
+            hideExpandedLargeIcon: true,
+          )
+        : BigTextStyleInformation(body, contentTitle: title);
 
     final details = AndroidNotificationDetails(
       AppConstants.notificationChannelId,
       AppConstants.notificationChannelName,
       channelDescription: AppConstants.notificationChannelDescription,
       icon: AppConstants.notificationIcon,
+      largeIcon: bytes != null ? ByteArrayAndroidBitmap(bytes) : null,
       importance: Importance.low,
       priority: Priority.low,
       ongoing: true,
@@ -573,33 +668,29 @@ class TripTaskHandler extends TaskHandler {
       showWhen: false,
       category: AndroidNotificationCategory.service,
       visibility: NotificationVisibility.public,
-      color: const Color(0xFF00E5A0),
-      // Barra de progreso nativa: avanza como la línea de tiempo de una canción.
+      color: const Color(0xFF1DB954),
+      subText: summary,
       showProgress: true,
-      maxProgress: 100,
-      progress: p.percent,
+      maxProgress: maxKm,
+      progress: doneKm,
       indeterminate: false,
-      styleInformation: BigTextStyleInformation(
-        body,
-        contentTitle: title,
-        summaryText: summary,
-      ),
+      styleInformation: style,
       actions: const <AndroidNotificationAction>[
         AndroidNotificationAction(
-          AppConstants.actionExplore,
-          '🔍 ¿Qué hay aquí?',
-          showsUserInterface: true,
-          cancelNotification: false,
-        ),
-        AndroidNotificationAction(
           AppConstants.actionRefresh,
-          '🔄 Actualizar ahora',
+          '🔄 Actualizar',
           showsUserInterface: false,
           cancelNotification: false,
         ),
         AndroidNotificationAction(
+          AppConstants.actionExplore,
+          '🧭 Explorar',
+          showsUserInterface: true,
+          cancelNotification: false,
+        ),
+        AndroidNotificationAction(
           AppConstants.actionStop,
-          '⏹️ Finalizar ruta',
+          '⏹ Salir',
           showsUserInterface: false,
           cancelNotification: false,
         ),
@@ -620,8 +711,12 @@ class TripTaskHandler extends TaskHandler {
       final bar = _textBar(p.percent);
       await FlutterForegroundTask.updateService(
         notificationTitle: title,
-        notificationText: '$bar ${p.percent}% · $base',
+        notificationText: '$bar ${p.percent}% · $subtitle',
       );
+    }
+
+    if (town != null && bytes == null) {
+      unawaited(_loadHeroAndRefresh(town));
     }
   }
 
