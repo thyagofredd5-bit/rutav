@@ -91,8 +91,11 @@ class PhotoFetcherService {
     }
     if (url == null || url.toLowerCase().endsWith('.svg')) return const [];
 
-    final pageUrl = (json['content_urls'] is Map)
-        ? ((json['content_urls'] as Map)['desktop'] as Map? ?? {})['page'] as String?
+    String? pageUrl;
+    if (json['content_urls'] is Map && (json['content_urls'] as Map)['desktop'] is Map) {
+      pageUrl = ((json['content_urls'] as Map)['desktop'] as Map)['page']?.toString();
+    }
+
     return [
       TownPhoto(
         url: url,
