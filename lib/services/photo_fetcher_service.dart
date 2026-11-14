@@ -30,7 +30,7 @@ class PhotoFetcherService {
 
   final http.Client _client;
 
-  static const Map<String, String> _wikiHeaders = {
+  static final Map<String, String> _wikiHeaders = {
     ...AppConstants.httpHeaders,
     'Api-User-Agent': AppConstants.httpUserAgent,
     'Accept': 'application/json',
